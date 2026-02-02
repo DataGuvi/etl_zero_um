@@ -1,0 +1,6 @@
+boto3
+dotenv
+pandas
+psycopg2
+redshift_connector
+requests

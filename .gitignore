@@ -1,0 +1,10 @@
+.env
+venv/
+
+*.ipynb
+
+*.xls
+*.xlsx
+*.csv
+
+*.log
