@@ -162,3 +162,24 @@ class ConnectionDB:
                 cur.close()
             if conn:
                 conn.close()
+
+    def executa_script(script: str, logger) -> pd.DataFrame:
+        try:
+            logger.info("Executando script passado.")
+            print("Executando script passado.")
+
+            df = pd.read_sql(script, conn)
+
+            return df
+        
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.info(f"Erro ao executar o script: {e}")
+            print(f"Erro ao executar o script: {e}")
+            raise
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
