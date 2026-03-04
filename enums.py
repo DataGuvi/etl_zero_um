@@ -106,6 +106,12 @@ class MetabaseCard(Enum):
     ZeroUm_UsuariosTotalizador = "card__14828"
     ZeroUm_UsuariosTotalizadorBet = "card__14917"
 
+    #Codigo das consultas de validação
+    ZeroUm_Validacao_ApostasDia = "card__17300"
+    ZeroUm_Validacao_DepositoSaque = "card__17297"
+    ZeroUm_Validacao_RegistroUsuario = "card__17299"
+
+
     EnergiaBet_Stage = "card__15848"
     EnergiaBet_Deposito = "card__15842"
     EnergiaBet_PrimeiraAposta = "card__15845"
@@ -120,3 +126,9 @@ class MetabaseCard(Enum):
     EnergiaBet_Usuarios = "card__15850"
     EnergiaBet_UsuariosTotalizador = "card__15851"
     EnergiaBet_UsuariosTotalizadorBet = "card__15852"
+
+
+    #Codigo das consultas de validação
+    EnergiaBet_Validacao_ApostasDia = "card__17513"
+    EnergiaBet_Validacao_DepositoSaque = "card__17514"
+    EnergiaBet_Validacao_RegistroUsuario = "card__17515"
