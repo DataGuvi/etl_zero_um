@@ -268,8 +268,8 @@ class ConsumeAPI:
         #    data_final = data_base
         #else:
         #    data_final = data_base + timedelta(days=1)
-        data_inicial = data_base - timedelta(hours=1)
-        data_inicial = data_inicial.strftime('%Y-%m-%d')
+        data_inicial = data_base - timedelta(hours=4)
+        data_inicial = data_inicial.strftime('%Y-%m-%dT%H:%M:%S')
         #data_final = data_final.strftime('%Y-%m-%d')
 
         print('datas')
