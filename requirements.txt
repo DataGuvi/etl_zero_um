@@ -1,6 +1,6 @@
 boto3
 dotenv
 pandas
-psycopg2
+psycopg2-binary
 redshift_connector
 requests
