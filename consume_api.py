@@ -34,6 +34,16 @@ class ConsumeAPI:
             self.logger.error("Cliente inválido")
 
     def principal_zeroum(self):
+        #data_final = "2026-02-25T00:00:00"
+        #while data_final < "2026-03-07T00:00:00":
+        #print("atualizando as datas")
+        #data_inicial = data_final
+        #data_final = (datetime.strptime(data_final, '%Y-%m-%dT%H:%M:%S') + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%S')
+        #data_final = data_final + timedelta(days=5)
+        #print("data_inicial")
+        #print(data_inicial)
+        #print("data_final")
+        #print(data_final)
         self.logger.info("Iniciando ETL")
         self.logger.info("Fazendo a autenticação no Metabase")
         auth_id = self.conection('ZEROUM')
@@ -72,37 +82,37 @@ class ConsumeAPI:
         ConnectionDB.conecta(DB, 'ZEROUM')
         ConnectionDB.deleta_dados('inplay.stg_usuario', "", self.logger)
 
-        #data_inicial = "2026-01-21T00:00:00"
-        #data_final = "2026-01-26T00:00:00"
+        #data_inicial = "2026-03-04T00:00:00"
+        #data_final = "2026-03-07T00:00:00"
         self.logger.info("Iniciando as consultas ao metabase e inserção dos dados")
         df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Stage.value, data_inicial, 0)
         df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Deposito.value, data_inicial, 0)
         df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Saque.value, data_inicial, 0)
-        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_PrimeiraAposta.value, 0, 0)
-        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UltimaAposta.value, 0, 0)
+        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_PrimeiraAposta.value, data_inicial, 0)
+        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UltimaAposta.value, data_inicial, 0)
         df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Bonus.value, data_inicial, 0)
         df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_BonusAtivado.value, data_inicial, 0)
         
         #print("df_primeira_aposta")
         #print(df_primeira_aposta)
         """df_stg = df_stg.merge(df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
+                                    on=['usuario', 'data_referencia'],
+                                    how='outer')
         df_stg = df_stg.merge(df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
+                                    on=['usuario', 'data_referencia'],
+                                    how='outer')
         df_stg = df_stg.merge(df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
+                                    on=['usuario', 'data_referencia'],
+                                    how='outer')
         df_stg = df_stg.merge(df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']], 
-                                      on=['usuario'],
-                                      how='left')
+                                    on=['usuario'],
+                                    how='left')
         df_stg = df_stg.merge(df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']], 
-                                      on=['usuario'],
-                                      how='left')
+                                    on=['usuario'],
+                                    how='left')
         df_stg = df_stg.merge(df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='left')"""
+                                    on=['usuario', 'data_referencia'],
+                                    how='left')"""
         
         #nome_arquivo = f"stg_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         #df_stg.to_csv(nome_arquivo, index=False, encoding="utf-8")
@@ -217,14 +227,14 @@ class ConsumeAPI:
 
         df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Usuarios.value, data_inicial, 0)
         df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                       'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
-                                       'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                       'last_withdraw_date','last_withdraw_amount', 'utm']]
+                                    'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+                                    'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
+                                    'last_withdraw_date','last_withdraw_amount', 'utm']]
         df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizador.value, data_inicial, 0)
         df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
         df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizadorBet.value, data_inicial, 0)
         df_usuario_totalizador_bet_ajust = df_usuario_totalizador_bet[['id','total_quantity_bet','total_amount_bet','total_quantity_win','total_amount_win', 'total_quantity_bonus',
-                                                                       'total_amount_bonus', 'total_ggr']]
+                                                                    'total_amount_bonus', 'total_ggr']]
 
         #nome_arquivo = f"df_usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         #df_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
@@ -234,11 +244,11 @@ class ConsumeAPI:
         #df_usuario_totalizador_bet.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
         df_dim_usuario = df_usuario_ajust.merge(df_usuario_totalizador_ajust, 
-                                      on=['id'],
-                                      how='outer')
+                                    on=['id'],
+                                    how='outer')
         df_dim_usuario = df_dim_usuario.merge(df_usuario_totalizador_bet_ajust, 
-                                      on=['id'],
-                                      how='outer')
+                                    on=['id'],
+                                    how='outer')
 
         #nome_arquivo = f"df_usuario_merged_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         #df_dim_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
@@ -249,7 +259,7 @@ class ConsumeAPI:
         ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
         ConnectionDB.conecta(DB, 'ZEROUM')
         ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
-     
+        
     def principal_energiabet(self):
         self.logger.info("Iniciando ETL")
         self.logger.info("Fazendo a autenticação no Metabase")
@@ -295,8 +305,8 @@ class ConsumeAPI:
         df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Stage.value, data_inicial, 0)
         df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Deposito.value, data_inicial, 0)
         df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Saque.value, data_inicial, 0)
-        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_PrimeiraAposta.value, 0, 0)
-        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UltimaAposta.value, 0, 0)
+        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_PrimeiraAposta.value, data_inicial, 0)
+        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UltimaAposta.value, data_inicial, 0)
         df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Bonus.value, data_inicial, 0)
         df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_BonusAtivado.value, data_inicial, 0)
         
