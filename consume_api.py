@@ -26,448 +26,457 @@ class ConsumeAPI:
         logging.basicConfig(handlers=[handler], level=logging.INFO)
         if cliente == 'ZEROUM':
             self.principal_zeroum()
-            #self.valida_dados('ZEROUM')
+        elif cliente == 'ZEROUM_VALIDACAO':
+            self.valida_dados('ZEROUM')
         elif cliente == 'ENERGIABET':
             self.principal_energiabet()
-            #self.valida_dados('ENERGIABET')
+        elif cliente == 'ENERGIABET_VALIDACAO':
+            self.valida_dados('ENERGIABET')
         else:
             self.logger.error("Cliente inválido")
 
     def principal_zeroum(self):
-        #data_final = "2026-02-25T00:00:00"
-        #while data_final < "2026-03-07T00:00:00":
-        #print("atualizando as datas")
-        #data_inicial = data_final
-        #data_final = (datetime.strptime(data_final, '%Y-%m-%dT%H:%M:%S') + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%S')
-        #data_final = data_final + timedelta(days=5)
-        #print("data_inicial")
-        #print(data_inicial)
-        #print("data_final")
-        #print(data_final)
-        self.logger.info("Iniciando ETL")
-        self.logger.info("Fazendo a autenticação no Metabase")
-        auth_id = self.conection('ZEROUM')
-        #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        self.logger.info("Recuperando a data base para consulta")
-        data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
-        print('data_importacao')
-        print(data_importacao)
-        data_base = data_importacao[0][0]
-        #data_inicial = data_base - timedelta(days=5)
-        print('data base')
-        print(data_base)
-        #if(data_base >= date.today()):
-        #    data_final = data_base
-        #else:
-        #    data_final = data_base + timedelta(days=1)
-        data_inicial = data_base - timedelta(hours=4)
-        data_inicial = data_inicial.strftime('%Y-%m-%dT%H:%M:%S')
-        #data_final = data_final.strftime('%Y-%m-%d')
+        try:
+            #data_final = "2026-02-25T00:00:00"
+            #while data_final < "2026-03-07T00:00:00":
+            #print("atualizando as datas")
+            #data_inicial = data_final
+            #data_final = (datetime.strptime(data_final, '%Y-%m-%dT%H:%M:%S') + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%S')
+            #data_final = data_final + timedelta(days=5)
+            #print("data_inicial")
+            #print(data_inicial)
+            #print("data_final")
+            #print(data_final)
+            self.logger.info("Iniciando ETL")
+            self.logger.info("Fazendo a autenticação no Metabase")
+            auth_id = self.conection('ZEROUM')
+            #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            self.logger.info("Recuperando a data base para consulta")
+            data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
+            print('data_importacao')
+            print(data_importacao)
+            data_base = data_importacao[0][0]
+            #data_inicial = data_base - timedelta(days=5)
+            print('data base')
+            print(data_base)
+            #if(data_base >= date.today()):
+            #    data_final = data_base
+            #else:
+            #    data_final = data_base + timedelta(days=1)
+            data_inicial = data_base - timedelta(hours=4)
+            data_inicial = data_inicial.strftime('%Y-%m-%dT%H:%M:%S')
+            #data_final = data_final.strftime('%Y-%m-%d')
 
-        print('datas')
-        print(data_inicial)
+            print('datas')
+            print(data_inicial)
 
-        self.logger.info("Deletando dados das stages")
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily_sport', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_game', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_deposits_withdraws_summarized', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_casino_games_hourly', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_usuario', "", self.logger)
+            self.logger.info("Deletando dados das stages")
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily_sport', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_game', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_deposits_withdraws_summarized', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_casino_games_hourly', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_usuario', "", self.logger)
 
-        #data_inicial = "2026-03-04T00:00:00"
-        #data_final = "2026-03-07T00:00:00"
-        self.logger.info("Iniciando as consultas ao metabase e inserção dos dados")
-        df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Stage.value, data_inicial, 0)
-        df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Deposito.value, data_inicial, 0)
-        df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Saque.value, data_inicial, 0)
-        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_PrimeiraAposta.value, data_inicial, 0)
-        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UltimaAposta.value, data_inicial, 0)
-        df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Bonus.value, data_inicial, 0)
-        df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_BonusAtivado.value, data_inicial, 0)
-        
-        #print("df_primeira_aposta")
-        #print(df_primeira_aposta)
-        """df_stg = df_stg.merge(df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']], 
-                                    on=['usuario', 'data_referencia'],
-                                    how='outer')
-        df_stg = df_stg.merge(df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']], 
-                                    on=['usuario', 'data_referencia'],
-                                    how='outer')
-        df_stg = df_stg.merge(df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']], 
-                                    on=['usuario', 'data_referencia'],
-                                    how='outer')
-        df_stg = df_stg.merge(df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']], 
-                                    on=['usuario'],
-                                    how='left')
-        df_stg = df_stg.merge(df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']], 
-                                    on=['usuario'],
-                                    how='left')
-        df_stg = df_stg.merge(df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']], 
-                                    on=['usuario', 'data_referencia'],
-                                    how='left')"""
-        
-        #nome_arquivo = f"stg_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_stg.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"deposito_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_deposito.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"saque_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_saque.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"primeira_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_primeira_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"ultima_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_ultima_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"bonus_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_bonus.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #print("finaliza salvar os arquivos")
+            #data_inicial = "2026-03-04T00:00:00"
+            #data_final = "2026-03-07T00:00:00"
+            self.logger.info("Iniciando as consultas ao metabase e inserção dos dados")
+            df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Stage.value, data_inicial, 0)
+            df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Deposito.value, data_inicial, 0)
+            df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Saque.value, data_inicial, 0)
+            df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_PrimeiraAposta.value, data_inicial, 0)
+            df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UltimaAposta.value, data_inicial, 0)
+            df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Bonus.value, data_inicial, 0)
+            df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_BonusAtivado.value, data_inicial, 0)
+            
+            #print("df_primeira_aposta")
+            #print(df_primeira_aposta)
+            """df_stg = df_stg.merge(df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']], 
+                                        on=['usuario'],
+                                        how='left')
+            df_stg = df_stg.merge(df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']], 
+                                        on=['usuario'],
+                                        how='left')
+            df_stg = df_stg.merge(df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='left')"""
+            
+            #nome_arquivo = f"stg_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_stg.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"deposito_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_deposito.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"saque_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_saque.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"primeira_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_primeira_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"ultima_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_ultima_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"bonus_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_bonus.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #print("finaliza salvar os arquivos")
 
-        df_stg = df_stg.replace({np.nan: None})
-        df_deposito = df_deposito.replace({np.nan: None})
-        df_saque = df_saque.replace({np.nan: None})
-        df_bonus = df_bonus.replace({np.nan: None})
-        df_primeira_aposta = df_primeira_aposta.replace({np.nan: None})
-        df_ultima_aposta = df_ultima_aposta.replace({np.nan: None})
-        df_bonus_ativado = df_bonus_ativado.replace({np.nan: None})
+            df_stg = df_stg.replace({np.nan: None})
+            df_deposito = df_deposito.replace({np.nan: None})
+            df_saque = df_saque.replace({np.nan: None})
+            df_bonus = df_bonus.replace({np.nan: None})
+            df_primeira_aposta = df_primeira_aposta.replace({np.nan: None})
+            df_ultima_aposta = df_ultima_aposta.replace({np.nan: None})
+            df_bonus_ativado = df_bonus_ativado.replace({np.nan: None})
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_stg, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_stg, ['usuario', 'data_referencia'], self.logger)
-        
-        df_deposito = df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_deposito, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_deposito, ['usuario', 'data_referencia'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_stg, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_stg, ['usuario', 'data_referencia'], self.logger)
+            
+            df_deposito = df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_deposito, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_deposito, ['usuario', 'data_referencia'], self.logger)
 
-        df_saque = df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_saque, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_saque, ['usuario', 'data_referencia'], self.logger)
+            df_saque = df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_saque, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_saque, ['usuario', 'data_referencia'], self.logger)
 
-        df_bonus = df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus, ['usuario', 'data_referencia'], self.logger)
+            df_bonus = df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus, ['usuario', 'data_referencia'], self.logger)
 
-        df_primeira_aposta = df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_primeira_aposta, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_primeira_aposta, ['usuario'], self.logger)
+            df_primeira_aposta = df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_primeira_aposta, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_primeira_aposta, ['usuario'], self.logger)
 
-        df_ultima_aposta = df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_ultima_aposta, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_ultima_aposta, ['usuario'], self.logger)
+            df_ultima_aposta = df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_ultima_aposta, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_ultima_aposta, ['usuario'], self.logger)
 
-        df_bonus_ativado = df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']]
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus_ativado, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus_ativado, ['usuario', 'data_referencia'], self.logger)
+            df_bonus_ativado = df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']]
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus_ativado, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus_ativado, ['usuario', 'data_referencia'], self.logger)
 
-        df_stg_sport = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_StageSport.value, data_inicial, 0)
+            df_stg_sport = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_StageSport.value, data_inicial, 0)
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily_sport', df_stg_sport, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily_sport', 'inplay.fact_user_daily_sport', df_stg_sport, ['usuario', 'data_referencia'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily_sport', df_stg_sport, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily_sport', 'inplay.fact_user_daily_sport', df_stg_sport, ['usuario', 'data_referencia'], self.logger)
 
-        df_fact_dep_saq_dias = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_DepositoSaqueDias.value, data_inicial, 0)
-        df_fact_dep_saq_dias_ajust = df_fact_dep_saq_dias[['date', 'hora', 'tipo', 'qtd', 'amount', 'updated_at', 'import_date']]
+            df_fact_dep_saq_dias = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_DepositoSaqueDias.value, data_inicial, 0)
+            df_fact_dep_saq_dias_ajust = df_fact_dep_saq_dias[['date', 'hora', 'tipo', 'qtd', 'amount', 'updated_at', 'import_date']]
 
-        #nome_arquivo = f"df_fact_dep_saq_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_fact_dep_saq_dias_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_fact_dep_saq_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_fact_dep_saq_dias_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_deposits_withdraws_summarized', 'inplay.fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, ['date', 'hora', 'tipo'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_deposits_withdraws_summarized', 'inplay.fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, ['date', 'hora', 'tipo'], self.logger)
 
-        df_dim_game = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Jogos.value, 0, 0)
+            df_dim_game = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Jogos.value, 0, 0)
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_game', df_dim_game, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_game', 'inplay.dim_game', df_dim_game, ['game_id', 'estado'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_game', df_dim_game, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_game', 'inplay.dim_game', df_dim_game, ['game_id', 'estado'], self.logger)
 
-        df_fact_cassino_game_hourly = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_ApostasJogosHora.value, data_inicial, 0)
-        df_fact_cassino_game_hourly_ajust = df_fact_cassino_game_hourly[['reference', 'game_id', 'with_bonus', 'bet_amount', 'win_amount', 'bet_qty', 'win_qty', 'ggr_amount', 'updated_at', 'data_importacao']]
+            df_fact_cassino_game_hourly = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_ApostasJogosHora.value, data_inicial, 0)
+            df_fact_cassino_game_hourly_ajust = df_fact_cassino_game_hourly[['reference', 'game_id', 'with_bonus', 'bet_amount', 'win_amount', 'bet_qty', 'win_qty', 'ggr_amount', 'updated_at', 'data_importacao']]
 
-        #nome_arquivo = f"df_game_hourly_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_fact_cassino_game_hourly_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_game_hourly_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_fact_cassino_game_hourly_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
 
-        df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Usuarios.value, data_inicial, 0)
-        df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                    'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
-                                    'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                    'last_withdraw_date','last_withdraw_amount', 'utm']]
-        df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizador.value, data_inicial, 0)
-        df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
-        df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizadorBet.value, data_inicial, 0)
-        df_usuario_totalizador_bet_ajust = df_usuario_totalizador_bet[['id','total_quantity_bet','total_amount_bet','total_quantity_win','total_amount_win', 'total_quantity_bonus',
-                                                                    'total_amount_bonus', 'total_ggr']]
+            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Usuarios.value, data_inicial, 0)
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
+                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+                                        'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
+                                        'last_withdraw_date','last_withdraw_amount', 'utm']]
+            df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizador.value, data_inicial, 0)
+            df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
+            df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizadorBet.value, data_inicial, 0)
+            df_usuario_totalizador_bet_ajust = df_usuario_totalizador_bet[['id','total_quantity_bet','total_amount_bet','total_quantity_win','total_amount_win', 'total_quantity_bonus',
+                                                                        'total_amount_bonus', 'total_ggr']]
 
-        #nome_arquivo = f"df_usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"df_usuario_totalizador_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_usuario_totalizador.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"df_usuario_totalizador_bet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_usuario_totalizador_bet.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_usuario_totalizador_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_usuario_totalizador.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_usuario_totalizador_bet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_usuario_totalizador_bet.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        df_dim_usuario = df_usuario_ajust.merge(df_usuario_totalizador_ajust, 
-                                    on=['id'],
-                                    how='outer')
-        df_dim_usuario = df_dim_usuario.merge(df_usuario_totalizador_bet_ajust, 
-                                    on=['id'],
-                                    how='outer')
+            df_dim_usuario = df_usuario_ajust.merge(df_usuario_totalizador_ajust, 
+                                        on=['id'],
+                                        how='outer')
+            df_dim_usuario = df_dim_usuario.merge(df_usuario_totalizador_bet_ajust, 
+                                        on=['id'],
+                                        how='outer')
 
-        #nome_arquivo = f"df_usuario_merged_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_dim_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        
-        df_dim_usuario = df_dim_usuario.replace({np.nan: None})
+            #nome_arquivo = f"df_usuario_merged_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_dim_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            
+            df_dim_usuario = df_dim_usuario.replace({np.nan: None})
 
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
-        ConnectionDB.conecta(DB, 'ZEROUM')
-        ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
+            ConnectionDB.conecta(DB, 'ZEROUM')
+            ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Erro na execução do ETL: {e}")
         
     def principal_energiabet(self):
-        self.logger.info("Iniciando ETL")
-        self.logger.info("Fazendo a autenticação no Metabase")
-        auth_id = self.conection('ENERGIABET')
-        #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        self.logger.info("Recuperando a data base para consulta")
-        data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
-        print('data_importacao')
-        print(data_importacao)
-        data_base = data_importacao[0][0]
-        #data_inicial = data_base - timedelta(days=5)
-        print('data base')
-        print(data_base)
-        #if(data_base >= date.today()):
-        #    data_final = data_base
-        #else:
-        #    data_final = data_base + timedelta(days=1)
-        data_inicial = data_base - timedelta(hours=4)
-        data_inicial = data_inicial.strftime('%Y-%m-%dT%H:%M:%S')
-        #data_final = data_final.strftime('%Y-%m-%d')
+        try:
 
-        print('datas')
-        print(data_inicial)
+            self.logger.info("Iniciando ETL")
+            self.logger.info("Fazendo a autenticação no Metabase")
+            auth_id = self.conection('ENERGIABET')
+            #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            self.logger.info("Recuperando a data base para consulta")
+            data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
+            print('data_importacao')
+            print(data_importacao)
+            data_base = data_importacao[0][0]
+            #data_inicial = data_base - timedelta(days=5)
+            print('data base')
+            print(data_base)
+            #if(data_base >= date.today()):
+            #    data_final = data_base
+            #else:
+            #    data_final = data_base + timedelta(days=1)
+            data_inicial = data_base - timedelta(hours=4)
+            data_inicial = data_inicial.strftime('%Y-%m-%dT%H:%M:%S')
+            #data_final = data_final.strftime('%Y-%m-%d')
 
-        self.logger.info("Deletando dados das stages")
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily_sport', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_game', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_deposits_withdraws_summarized', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_casino_games_hourly', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_usuario', "", self.logger)
+            print('datas')
+            print(data_inicial)
 
-        #data_inicial = "2026-02-01T00:00:00"
-        #data_final = "2026-03-01T00:00:00"
-        self.logger.info("Iniciando as consultas ao metabase e inserção dos dados")
-        df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Stage.value, data_inicial, 0)
-        df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Deposito.value, data_inicial, 0)
-        df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Saque.value, data_inicial, 0)
-        df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_PrimeiraAposta.value, data_inicial, 0)
-        df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UltimaAposta.value, data_inicial, 0)
-        df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Bonus.value, data_inicial, 0)
-        df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_BonusAtivado.value, data_inicial, 0)
-        
-        #print("df_primeira_aposta")
-        #print(df_primeira_aposta)
-        """df_stg = df_stg.merge(df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
-        df_stg = df_stg.merge(df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
-        df_stg = df_stg.merge(df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='outer')
-        df_stg = df_stg.merge(df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']], 
-                                      on=['usuario'],
-                                      how='left')
-        df_stg = df_stg.merge(df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']], 
-                                      on=['usuario'],
-                                      how='left')
-        df_stg = df_stg.merge(df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']], 
-                                      on=['usuario', 'data_referencia'],
-                                      how='left')"""
-        
-        #nome_arquivo = f"stg_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_stg.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"deposito_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_deposito.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"saque_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_saque.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"primeira_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_primeira_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"ultima_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_ultima_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"bonus_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_bonus.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #print("finaliza salvar os arquivos")
+            self.logger.info("Deletando dados das stages")
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily_sport', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_game', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_deposits_withdraws_summarized', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_casino_games_hourly', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_usuario', "", self.logger)
 
-        df_stg = df_stg.replace({np.nan: None})
-        df_deposito = df_deposito.replace({np.nan: None})
-        df_saque = df_saque.replace({np.nan: None})
-        df_bonus = df_bonus.replace({np.nan: None})
-        df_primeira_aposta = df_primeira_aposta.replace({np.nan: None})
-        df_ultima_aposta = df_ultima_aposta.replace({np.nan: None})
-        df_bonus_ativado = df_bonus_ativado.replace({np.nan: None})
+            #data_inicial = "2026-02-01T00:00:00"
+            #data_final = "2026-03-01T00:00:00"
+            self.logger.info("Iniciando as consultas ao metabase e inserção dos dados")
+            df_stg = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Stage.value, data_inicial, 0)
+            df_deposito = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Deposito.value, data_inicial, 0)
+            df_saque = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Saque.value, data_inicial, 0)
+            df_primeira_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_PrimeiraAposta.value, data_inicial, 0)
+            df_ultima_aposta = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UltimaAposta.value, data_inicial, 0)
+            df_bonus = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Bonus.value, data_inicial, 0)
+            df_bonus_ativado = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_BonusAtivado.value, data_inicial, 0)
+            
+            #print("df_primeira_aposta")
+            #print(df_primeira_aposta)
+            """df_stg = df_stg.merge(df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='outer')
+            df_stg = df_stg.merge(df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']], 
+                                        on=['usuario'],
+                                        how='left')
+            df_stg = df_stg.merge(df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']], 
+                                        on=['usuario'],
+                                        how='left')
+            df_stg = df_stg.merge(df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']], 
+                                        on=['usuario', 'data_referencia'],
+                                        how='left')"""
+            
+            #nome_arquivo = f"stg_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_stg.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"deposito_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_deposito.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"saque_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_saque.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"primeira_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_primeira_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"ultima_aposta_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_ultima_aposta.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"bonus_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_bonus.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #print("finaliza salvar os arquivos")
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_stg, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_stg, ['usuario', 'data_referencia'], self.logger)
-        
-        df_deposito = df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_deposito, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_deposito, ['usuario', 'data_referencia'], self.logger)
+            df_stg = df_stg.replace({np.nan: None})
+            df_deposito = df_deposito.replace({np.nan: None})
+            df_saque = df_saque.replace({np.nan: None})
+            df_bonus = df_bonus.replace({np.nan: None})
+            df_primeira_aposta = df_primeira_aposta.replace({np.nan: None})
+            df_ultima_aposta = df_ultima_aposta.replace({np.nan: None})
+            df_bonus_ativado = df_bonus_ativado.replace({np.nan: None})
 
-        df_saque = df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_saque, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_saque, ['usuario', 'data_referencia'], self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_stg, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_stg, ['usuario', 'data_referencia'], self.logger)
+            
+            df_deposito = df_deposito[['usuario', 'data_referencia', 'deposit_amount', 'deposit_quantity', 'deposit_pending_amount', 'deposit_pending_quantity', 'ftd_date']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_deposito, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_deposito, ['usuario', 'data_referencia'], self.logger)
 
-        df_bonus = df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus, ['usuario', 'data_referencia'], self.logger)
+            df_saque = df_saque[['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity', 'withdraw_pending_amount', 'withdraw_pending_quantity', 'withdraw_denied_amount', 'withdraw_denied_quantity']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_saque, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_saque, ['usuario', 'data_referencia'], self.logger)
 
-        df_primeira_aposta = df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_primeira_aposta, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_primeira_aposta, ['usuario'], self.logger)
+            df_bonus = df_bonus[['usuario', 'data_referencia', 'bonus_amount', 'bonus_quantity']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus, ['usuario', 'data_referencia'], self.logger)
 
-        df_ultima_aposta = df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_ultima_aposta, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_ultima_aposta, ['usuario'], self.logger)
+            df_primeira_aposta = df_primeira_aposta[['usuario', 'casino_bet_first_date', 'casino_bet_first_amount']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_primeira_aposta, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_primeira_aposta, ['usuario'], self.logger)
 
-        df_bonus_ativado = df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']]
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus_ativado, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus_ativado, ['usuario', 'data_referencia'], self.logger)
-        
-        df_stg_sport = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_StageSport.value, data_inicial, 0)
+            df_ultima_aposta = df_ultima_aposta[['usuario', 'casino_bet_last_date', 'casino_bet_last_amount']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_ultima_aposta, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_ultima_aposta, ['usuario'], self.logger)
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily_sport', df_stg_sport, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily_sport', 'inplay.fact_user_daily_sport', df_stg_sport, ['usuario', 'data_referencia'], self.logger)
+            df_bonus_ativado = df_bonus_ativado[['usuario', 'data_referencia', 'bonus_activated']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_bonus_ativado, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily', 'inplay.fact_user_daily', df_bonus_ativado, ['usuario', 'data_referencia'], self.logger)
+            
+            df_stg_sport = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_StageSport.value, data_inicial, 0)
 
-        df_fact_dep_saq_dias = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_DepositoSaqueDias.value, data_inicial, 0)
-        df_fact_dep_saq_dias_ajust = df_fact_dep_saq_dias[['date', 'hora', 'tipo', 'qtd', 'amount', 'updated_at', 'import_date']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily_sport', df_stg_sport, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_user_daily_sport', 'inplay.fact_user_daily_sport', df_stg_sport, ['usuario', 'data_referencia'], self.logger)
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_deposits_withdraws_summarized', 'inplay.fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, ['date', 'hora', 'tipo'], self.logger)
+            df_fact_dep_saq_dias = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_DepositoSaqueDias.value, data_inicial, 0)
+            df_fact_dep_saq_dias_ajust = df_fact_dep_saq_dias[['date', 'hora', 'tipo', 'qtd', 'amount', 'updated_at', 'import_date']]
 
-        df_dim_game = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Jogos.value, 0, 0)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_deposits_withdraws_summarized', 'inplay.fact_deposits_withdraws_summarized', df_fact_dep_saq_dias_ajust, ['date', 'hora', 'tipo'], self.logger)
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_game', df_dim_game, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_game', 'inplay.dim_game', df_dim_game, ['game_id', 'estado'], self.logger)
+            df_dim_game = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Jogos.value, 0, 0)
 
-        df_fact_cassino_game_hourly = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_ApostasJogosHora.value, data_inicial, 0)
-        df_fact_cassino_game_hourly_ajust = df_fact_cassino_game_hourly[['reference', 'game_id', 'with_bonus', 'bet_amount', 'win_amount', 'bet_qty', 'win_qty', 'ggr_amount', 'updated_at', 'data_importacao']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_game', df_dim_game, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_game', 'inplay.dim_game', df_dim_game, ['game_id', 'estado'], self.logger)
 
-        #nome_arquivo = f"df_game_hourly_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_fact_cassino_game_hourly_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            df_fact_cassino_game_hourly = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_ApostasJogosHora.value, data_inicial, 0)
+            df_fact_cassino_game_hourly_ajust = df_fact_cassino_game_hourly[['reference', 'game_id', 'with_bonus', 'bet_amount', 'win_amount', 'bet_qty', 'win_qty', 'ggr_amount', 'updated_at', 'data_importacao']]
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
+            #nome_arquivo = f"df_game_hourly_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_fact_cassino_game_hourly_ajust.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Usuarios.value, data_inicial, 0)
-        df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                       'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
-                                       'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                       'last_withdraw_date','last_withdraw_amount', 'utm']]
-        df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizador.value, data_inicial, 0)
-        df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
-        df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizadorBet.value, data_inicial, 0)
-        df_usuario_totalizador_bet_ajust = df_usuario_totalizador_bet[['id','total_quantity_bet','total_amount_bet','total_quantity_win','total_amount_win', 'total_quantity_bonus',
-                                                                       'total_amount_bonus', 'total_ggr']]
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
 
-        #nome_arquivo = f"df_usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
-        #nome_arquivo = f"df_usuario_totalizador_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_usuario_totalizador.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Usuarios.value, data_inicial, 0)
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
+                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+                                        'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
+                                        'last_withdraw_date','last_withdraw_amount', 'utm']]
+            df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizador.value, data_inicial, 0)
+            df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
+            df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizadorBet.value, data_inicial, 0)
+            df_usuario_totalizador_bet_ajust = df_usuario_totalizador_bet[['id','total_quantity_bet','total_amount_bet','total_quantity_win','total_amount_win', 'total_quantity_bonus',
+                                                                        'total_amount_bonus', 'total_ggr']]
 
-        df_dim_usuario = df_usuario_ajust.merge(df_usuario_totalizador_ajust, 
-                                      on=['id'],
-                                      how='outer')
-        df_dim_usuario = df_dim_usuario.merge(df_usuario_totalizador_bet_ajust, 
-                                      on=['id'],
-                                      how='outer')
-        
-        df_dim_usuario = df_dim_usuario.replace({np.nan: None})
+            #nome_arquivo = f"df_usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_usuario.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            #nome_arquivo = f"df_usuario_totalizador_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_usuario_totalizador.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
-        ConnectionDB.conecta(DB, 'ENERGIABET')
-        ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
+            df_dim_usuario = df_usuario_ajust.merge(df_usuario_totalizador_ajust, 
+                                        on=['id'],
+                                        how='outer')
+            df_dim_usuario = df_dim_usuario.merge(df_usuario_totalizador_bet_ajust, 
+                                        on=['id'],
+                                        how='outer')
+            
+            df_dim_usuario = df_dim_usuario.replace({np.nan: None})
+
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
+            ConnectionDB.conecta(DB, 'ENERGIABET')
+            ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Erro na execução do ETL: {e}")
         
     
     def conection(self, cliente):
@@ -521,107 +530,7 @@ class ConsumeAPI:
             return resultado_csv
         except requests.exceptions.RequestException as e:
             raise Exception(f"Erro ao conectar na API: {e}")
-        
-    def extrai_dados_bet(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.Bet.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25456,None], data_inicial],
-            ["<",["field",25456,None], data_final]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #print('dataframe:')
-            #print(df)
-            #print(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = pd.to_datetime(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = df['LastUpdateTime'].dt.date
-            nome_arquivo = f"bet_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Bet: {e}")
-        
-    def extrai_dados_deposito(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.PaymentRequest.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25843,None], data_inicial],
-            ["<",["field",25843,None], data_final],
-            ["=", ["field", 25819,None], 1]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #df['LastUpdateTime'] = pd.to_datetime(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = df['LastUpdateTime'].dt.date
-            nome_arquivo = f"deposito_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Payment - Deposito: {e}")
-        
-    def extrai_dados_saque(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.PaymentRequest.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25843,None], data_inicial],
-            ["<",["field",25843,None], data_final],
-            ["=", ["field", 25819,None], 2]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #df['LastUpdateTime'] = pd.to_datetime(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = df['LastUpdateTime'].dt.date
-
-            nome_arquivo = f"saque_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Payment: {e}")
-        
-    def extrai_dados_cliente(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.Client.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25601,None], data_inicial],
-            ["<",["field",25601,None], data_final]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #df['LastUpdateTime'] = pd.to_datetime(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = df['LastUpdateTime'].dt.date
-            
-            nome_arquivo = f"cliente_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Cliente: {e}")
-        
-    def extrai_dados_cliente_bonus(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.ClientBonus.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25663,None], data_inicial],
-            ["<",["field",25663,None], data_final]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #df['CreationTime'] = pd.to_datetime(df['CreationTime'])
-            #df['CreationTime'] = df['CreationTime'].dt.date
-            df_retorno = df[['ClientId', 'CreationTime', 'FinalAmount']]
-            df_retorno = df_retorno.rename(columns={'CreationTime': 'BonusDate', 'FinalAmount': 'BonusAmount'})
-            nome_arquivo = f"cliente_bonus_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df_retorno.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df_retorno
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Bonus Cliente: {e}")
-        
-    def extrai_dados_sportsbook_bet(self, auth_id, data_inicial, data_final):
-        try:
-            id_database = MetabaseDatabase.ClickhousePartnerZeroum.value
-            id_table = MetabaseTable.SportsbookBet.value
-            csv = self.extrai_csv(auth_id, id_database, id_table, "", ["and",[">=",["field",25888,None], data_inicial],
-            ["<",["field",25888,None], data_final]])
-            df = pd.read_csv(io.BytesIO(csv))
-            #df['LastUpdateTime'] = pd.to_datetime(df['LastUpdateTime'])
-            #df['LastUpdateTime'] = df['LastUpdateTime'].dt.date
-            df_retorno = df[['ID', 'ClientId', 'LastUpdateTime', 'ProductId', 'BetTime', 'BetAmount', 'WinAmount', 'Ggr', 'BetBonusAmount', 'WinBonusAmount']]
-            #nome_arquivo = f"bet_dados_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            #df_retorno.to_csv(nome_arquivo, index=False, encoding="utf-8")
-            return df_retorno
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Erro ao extrair os dados da tabela Sportsbook Bet: {e}")
-        
+                                               
     def extrai_dados_card(self, auth_id, id_database, id_card, data_inicial, data_final):
         try:
             #self.rota = f"https://inplaysoft.metabaseapp.com/api/card/{id}/query/csv"
