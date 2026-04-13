@@ -3,12 +3,12 @@ import pandas as pd
 import numpy as np
 import io
 from datetime import datetime, timedelta, date
-from config import API_AUTH, API_USER_ZEROUM, API_PASS_ZEROUM, API_USER_ENERGIABET, API_PASS_ENERGIABET, API_ROTA_CSV 
+from config import API_AUTH, API_USER_ZEROUM, API_PASS_ZEROUM, API_USER_ENERGIABET, API_PASS_ENERGIABET, API_ROTA_CSV, DB
 from enums import MetabaseTable, MetabaseDatabase, MetabaseCard
 from database import ConnectionDB
-from config import DB
 import logging
 from logging.handlers import RotatingFileHandler
+from send_email import send_email
 
 class ConsumeAPI:
     def __init__(self, cliente):
@@ -32,6 +32,8 @@ class ConsumeAPI:
             self.principal_energiabet()
         elif cliente == 'ENERGIABET_VALIDACAO':
             self.valida_dados('ENERGIABET')
+        elif cliente == 'sobe_dados':
+            self.sobe_dados()
         else:
             self.logger.error("Cliente inválido")
 
@@ -263,11 +265,22 @@ class ConsumeAPI:
             ConnectionDB.conecta(DB, 'ZEROUM')
             ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
         except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro na execução do ETL ZEROUM: {e}")
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject="[FALHA ENGENHARIA] ZeroUm - Erro na execução do ETL", body=b)
             raise Exception(f"Erro na execução do ETL: {e}")
         
     def principal_energiabet(self):
         try:
-
+            #data_final = "2026-03-25T00:00:00"
+            #while data_final < "2026-03-31T00:00:00":
+            #print("atualizando as datas")
+            #data_inicial = data_final
+            #data_final = (datetime.strptime(data_final, '%Y-%m-%dT%H:%M:%S') + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%S')
+            #print("data_inicial")
+            #print(data_inicial)
+            #print("data_final")
+            #print(data_final)
             self.logger.info("Iniciando ETL")
             self.logger.info("Fazendo a autenticação no Metabase")
             auth_id = self.conection('ENERGIABET')
@@ -476,6 +489,9 @@ class ConsumeAPI:
             ConnectionDB.conecta(DB, 'ENERGIABET')
             ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
         except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro na execução do ETL ENERGIABET: {e}")
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject="[FALHA ENGENHARIA] EnergiaBet - Erro na execução do ETL", body=b)
             raise Exception(f"Erro na execução do ETL: {e}")
         
     
@@ -493,6 +509,9 @@ class ConsumeAPI:
             print("requisição realizada")
             id = response.json()['id']
         except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro na autenticação da API: {e}")
+            b = f"Ocorreu um erro na autenticação da API.\n\nDescrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject="[FALHA ENGENHARIA] API - Erro na autenticação", body=b)
             raise Exception(f"Erro ao conectar na API: {e}")
         return id
         
@@ -529,6 +548,9 @@ class ConsumeAPI:
             #df = pd.DataFrame(resultado_csv)
             return resultado_csv
         except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro ao extrair CSV da API: {e}")
+            b = f"Ocorreu um erro ao extrair CSV da API.\n\nDescrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject="[FALHA ENGENHARIA] API - Erro ao extrair CSV", body=b)
             raise Exception(f"Erro ao conectar na API: {e}")
                                                
     def extrai_dados_card(self, auth_id, id_database, id_card, data_inicial, data_final):
@@ -560,148 +582,167 @@ class ConsumeAPI:
             df = pd.read_csv(io.BytesIO(csv))
             return df
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Erro ao extrair os dados da consulta {id_card}")
+            self.logger.error(f"Erro ao extrair os dados da consulta {id_card}: {e}")
+            b = f"Erro no card {id_card}:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] Metabase - Erro card {id_card}", body=b)
             raise Exception(f"Erro ao extrair os dados do card {id}: {e}")
-        
+    
+    def sobe_dados(self):
+        df = pd.read_csv('jogos_jogador.csv', sep=';', header=0)
+
+        print(df)
+
+        #df['Id'] = df['Id'].astype(int)
+        df = df.astype(object)
+
+        ConnectionDB.conecta(DB, 'ZEROUM')
+        ConnectionDB.insere_dados_bulk('inplay.jogos_jogador', df, self.logger)
+           
     def valida_dados(self, cliente: str):
-        print('função para validar os dados da base')
-        self.logger.info("Iniciando o processo de validação dos dados")
-        df_validacao = pd.DataFrame()
-        database = MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM' else MetabaseDatabase.ClickhousePartnerEnergiabet.value
-        auth_id = self.conection(cliente)
-        card = MetabaseCard.ZeroUm_Validacao_ApostasDia.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_ApostasDia.value
-        df_apostas_dia_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
-        card = MetabaseCard.ZeroUm_Validacao_DepositoSaque.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_DepositoSaque.value
-        df_deposito_saque_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
-        card = MetabaseCard.ZeroUm_Validacao_RegistroUsuario.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_RegistroUsuario.value
-        df_usuario_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
+        try:
+            print('função para validar os dados da base')
+            self.logger.info("Iniciando o processo de validação dos dados")
+            df_validacao = pd.DataFrame()
+            database = MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM' else MetabaseDatabase.ClickhousePartnerEnergiabet.value
+            auth_id = self.conection(cliente)
+            card = MetabaseCard.ZeroUm_Validacao_ApostasDia.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_ApostasDia.value
+            df_apostas_dia_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
+            card = MetabaseCard.ZeroUm_Validacao_DepositoSaque.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_DepositoSaque.value
+            df_deposito_saque_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
+            card = MetabaseCard.ZeroUm_Validacao_RegistroUsuario.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_RegistroUsuario.value
+            df_usuario_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
 
-        nome_arquivo = f"usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        df_usuario_origem.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            nome_arquivo = f"usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            df_usuario_origem.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        df_validacao = df_apostas_dia_origem.merge(df_deposito_saque_origem[['data_referencia', 'deposit_amount_origem', 'deposit_qtd_origem', 'withdraw_amount_origem', 'withdraw_qtd_origem']], 
-                                      on=['data_referencia'],
-                                      how='left')
-        df_validacao = df_validacao.merge(df_usuario_origem[['data_referencia', 'users_registered_origem']], 
-                                      on=['data_referencia'],
-                                      how='left')
-        
-        #nome_arquivo = f"validacao_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        #df_validacao.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            df_validacao = df_apostas_dia_origem.merge(df_deposito_saque_origem[['data_referencia', 'deposit_amount_origem', 'deposit_qtd_origem', 'withdraw_amount_origem', 'withdraw_qtd_origem']], 
+                                        on=['data_referencia'],
+                                        how='left')
+            df_validacao = df_validacao.merge(df_usuario_origem[['data_referencia', 'users_registered_origem']], 
+                                        on=['data_referencia'],
+                                        how='left')
+            
+            #nome_arquivo = f"validacao_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            #df_validacao.to_csv(nome_arquivo, index=False, encoding="utf-8")
 
-        script = """
-                    with
-                    deposits_withdraw_summarized as (
-                        select 
-                            f.date,
-                            sum(case when f.tipo = 'deposit' then f.amount else 0 end)  as deposit_amount_destino_summarized,
-                            sum(case when f.tipo = 'deposit' then f.qtd else 0 end)  as deposit_qtd_destino_summarized,
-                            sum(case when f.tipo = 'withdraw' then f.amount else 0 end)  as withdraw_amount_destino_summarized,
-                            sum(case when f.tipo = 'withdraw' then f.qtd else 0 end)  as withdraw_qtd_destino_summarized
-                        from inplay.fact_deposits_withdraws_summarized f
-                        group by f.date
-                    ),
-                    user_daily as (
-                        select 
-                            f.data_referencia ,
-                            sum(f.deposit_amount) as deposit_amount_destino_user_daily,
-                            sum(f.deposit_quantity) as deposit_qtd_destino_user_daily,
-                            sum(f.withdraw_amount) as withdraw_amount_destino_user_daily,
-                            sum(f.withdraw_quantity) as withdraw_qtd_destino_user_daily,
-                            sum(f.cassino_bet_amount) as bet_amount_destino_user_daily,
-                            sum(f.cassino_bet_quantity) as bet_qtd_destino_user_daily
-                        from inplay.fact_user_daily f
-                        group by f.data_referencia
-                    ),
-                    casino_games as (
-                        select 
-                            f.reference::date,
-                            sum(f.bet_amount) as bet_amount_destino_casino_games,
-                            sum(f.bet_qty) as bet_qtd_destino_casino_games
-                        from inplay.fact_casino_games_hourly f
-                        group by reference::date 
-                    ),
-                    users_registration as (
-                        select 
-                            d.registration_date::date,
-                            count(1) as users_registered_destino_dim_usuario
-                        from inplay.dim_usuario d
-                        group by d.registration_date::date
-                    )
-                    select
-                        coalesce(s.date, ud.data_referencia, cg.reference) as data_referencia,
-                        -- deposit
-                        s.deposit_amount_destino_summarized,
-                        ud.deposit_amount_destino_user_daily,
-                        s.deposit_qtd_destino_summarized,
-                        ud.deposit_qtd_destino_user_daily,
-                        -- withdraw
-                        s.withdraw_amount_destino_summarized,
-                        ud.withdraw_amount_destino_user_daily,
-                        s.withdraw_qtd_destino_summarized,
-                        ud.withdraw_qtd_destino_user_daily,
-                        -- bets
-                        cg.bet_amount_destino_casino_games,
-                        ud.bet_amount_destino_user_daily,
-                        cg.bet_qtd_destino_casino_games,
-                        ud.bet_qtd_destino_user_daily,
-                        -- users_registration
-                        ur.users_registered_destino_dim_usuario,
-                    -- import_date
-                        timezone('America/Sao_Paulo', current_timestamp) as import_date
-                    from deposits_withdraw_summarized s
-                        full outer join user_daily ud on s.date = ud.data_referencia
-                        full outer join casino_games cg on coalesce(s.date, ud.data_referencia) = cg.reference
-                        full outer join users_registration ur on coalesce(s.date, ud.data_referencia, cg.reference) = ur.registration_date
-                    order by 1 desc;
-            """
+            script = """
+                        with
+                        deposits_withdraw_summarized as (
+                            select 
+                                f.date,
+                                sum(case when f.tipo = 'deposit' then f.amount else 0 end)  as deposit_amount_destino_summarized,
+                                sum(case when f.tipo = 'deposit' then f.qtd else 0 end)  as deposit_qtd_destino_summarized,
+                                sum(case when f.tipo = 'withdraw' then f.amount else 0 end)  as withdraw_amount_destino_summarized,
+                                sum(case when f.tipo = 'withdraw' then f.qtd else 0 end)  as withdraw_qtd_destino_summarized
+                            from inplay.fact_deposits_withdraws_summarized f
+                            group by f.date
+                        ),
+                        user_daily as (
+                            select 
+                                f.data_referencia ,
+                                sum(f.deposit_amount) as deposit_amount_destino_user_daily,
+                                sum(f.deposit_quantity) as deposit_qtd_destino_user_daily,
+                                sum(f.withdraw_amount) as withdraw_amount_destino_user_daily,
+                                sum(f.withdraw_quantity) as withdraw_qtd_destino_user_daily,
+                                sum(f.cassino_bet_amount) as bet_amount_destino_user_daily,
+                                sum(f.cassino_bet_quantity) as bet_qtd_destino_user_daily
+                            from inplay.fact_user_daily f
+                            group by f.data_referencia
+                        ),
+                        casino_games as (
+                            select 
+                                f.reference::date,
+                                sum(f.bet_amount) as bet_amount_destino_casino_games,
+                                sum(f.bet_qty) as bet_qtd_destino_casino_games
+                            from inplay.fact_casino_games_hourly f
+                            group by reference::date 
+                        ),
+                        users_registration as (
+                            select 
+                                d.registration_date::date,
+                                count(1) as users_registered_destino_dim_usuario
+                            from inplay.dim_usuario d
+                            group by d.registration_date::date
+                        )
+                        select
+                            coalesce(s.date, ud.data_referencia, cg.reference) as data_referencia,
+                            -- deposit
+                            s.deposit_amount_destino_summarized,
+                            ud.deposit_amount_destino_user_daily,
+                            s.deposit_qtd_destino_summarized,
+                            ud.deposit_qtd_destino_user_daily,
+                            -- withdraw
+                            s.withdraw_amount_destino_summarized,
+                            ud.withdraw_amount_destino_user_daily,
+                            s.withdraw_qtd_destino_summarized,
+                            ud.withdraw_qtd_destino_user_daily,
+                            -- bets
+                            cg.bet_amount_destino_casino_games,
+                            ud.bet_amount_destino_user_daily,
+                            cg.bet_qtd_destino_casino_games,
+                            ud.bet_qtd_destino_user_daily,
+                            -- users_registration
+                            ur.users_registered_destino_dim_usuario,
+                        -- import_date
+                            timezone('America/Sao_Paulo', current_timestamp) as import_date
+                        from deposits_withdraw_summarized s
+                            full outer join user_daily ud on s.date = ud.data_referencia
+                            full outer join casino_games cg on coalesce(s.date, ud.data_referencia) = cg.reference
+                            full outer join users_registration ur on coalesce(s.date, ud.data_referencia, cg.reference) = ur.registration_date
+                        order by 1 desc;
+                """
 
-        tabela_validacao = 'inplay.verificacao_zero_um' if cliente == 'ZEROUM' else 'inplay.verificacao_energia_bet'
-        ConnectionDB.conecta(DB, cliente)
-        ConnectionDB.deleta_dados(tabela_validacao, "", self.logger)
-        ConnectionDB.conecta(DB, cliente)
-        df_dados_destino = ConnectionDB.executa_script(script, self.logger)
+            tabela_validacao = 'inplay.verificacao_zero_um' if cliente == 'ZEROUM' else 'inplay.verificacao_energia_bet'
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados(tabela_validacao, "", self.logger)
+            ConnectionDB.conecta(DB, cliente)
+            df_dados_destino = ConnectionDB.executa_script(script, self.logger)
 
-        df_validacao['data_referencia'] = pd.to_datetime(df_validacao['data_referencia'])
-        df_dados_destino['data_referencia'] = pd.to_datetime(df_dados_destino['data_referencia'])
+            df_validacao['data_referencia'] = pd.to_datetime(df_validacao['data_referencia'])
+            df_dados_destino['data_referencia'] = pd.to_datetime(df_dados_destino['data_referencia'])
 
-        df_validacao = df_validacao.merge(df_dados_destino[['data_referencia', 'deposit_amount_destino_summarized', 'deposit_amount_destino_user_daily', 'deposit_qtd_destino_summarized', 'deposit_qtd_destino_user_daily',
-                                                            'withdraw_amount_destino_summarized', 'withdraw_amount_destino_user_daily', 'withdraw_qtd_destino_summarized', 'withdraw_qtd_destino_user_daily',
-                                                            'bet_amount_destino_casino_games', 'bet_amount_destino_user_daily', 'bet_qtd_destino_casino_games', 'bet_qtd_destino_user_daily', 
-                                                            'users_registered_destino_dim_usuario', 'import_date']], 
-                                      on=['data_referencia'],
-                                      how='outer')
-        
-        df_validacao = df_validacao.rename(columns={'data_referencia': 'data'})
-        df_validacao = df_validacao.replace({np.nan: None})
+            df_validacao = df_validacao.merge(df_dados_destino[['data_referencia', 'deposit_amount_destino_summarized', 'deposit_amount_destino_user_daily', 'deposit_qtd_destino_summarized', 'deposit_qtd_destino_user_daily',
+                                                                'withdraw_amount_destino_summarized', 'withdraw_amount_destino_user_daily', 'withdraw_qtd_destino_summarized', 'withdraw_qtd_destino_user_daily',
+                                                                'bet_amount_destino_casino_games', 'bet_amount_destino_user_daily', 'bet_qtd_destino_casino_games', 'bet_qtd_destino_user_daily', 
+                                                                'users_registered_destino_dim_usuario', 'import_date']], 
+                                        on=['data_referencia'],
+                                        how='outer')
+            
+            df_validacao = df_validacao.rename(columns={'data_referencia': 'data'})
+            df_validacao = df_validacao.replace({np.nan: None})
 
-        df_validacao['deposit_validacao'] = np.where(((df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_summarized']) |
-                                                      (df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_user_daily']) |
-                                                      (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_summarized']) |
-                                                      (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_user_daily'])), 
-                                                     'errado', 
-                                                     'certo')
-        
-        df_validacao['withdraw_validacao'] = np.where(((df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_summarized']) |
-                                                      (df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_user_daily']) |
-                                                      (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_summarized']) |
-                                                      (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_user_daily'])), 
-                                                     'errado', 
-                                                     'certo')
-        
-        df_validacao['bet_validacao'] = np.where(((df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_casino_games']) |
-                                                  (df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_user_daily']) |
-                                                  (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_casino_games']) |
-                                                  (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_user_daily'])), 
-                                                  'errado', 
-                                                  'certo')
-        
-        df_validacao['users_registered_validacao'] = np.where((df_validacao['users_registered_origem'] != df_validacao['users_registered_destino_dim_usuario']), 
-                                                     'errado', 
-                                                     'certo')
+            df_validacao['deposit_validacao'] = np.where(((df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_summarized']) |
+                                                        (df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_user_daily']) |
+                                                        (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_summarized']) |
+                                                        (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_user_daily'])), 
+                                                        'errado', 
+                                                        'certo')
+            
+            df_validacao['withdraw_validacao'] = np.where(((df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_summarized']) |
+                                                        (df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_user_daily']) |
+                                                        (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_summarized']) |
+                                                        (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_user_daily'])), 
+                                                        'errado', 
+                                                        'certo')
+            
+            df_validacao['bet_validacao'] = np.where(((df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_casino_games']) |
+                                                    (df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_user_daily']) |
+                                                    (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_casino_games']) |
+                                                    (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_user_daily'])), 
+                                                    'errado', 
+                                                    'certo')
+            
+            df_validacao['users_registered_validacao'] = np.where((df_validacao['users_registered_origem'] != df_validacao['users_registered_destino_dim_usuario']), 
+                                                        'errado', 
+                                                        'certo')
 
-        nome_arquivo = f"validacao2_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        df_validacao.to_csv(nome_arquivo, index=False, encoding="utf-8")
-               
-        ConnectionDB.conecta(DB, cliente)
-        ConnectionDB.insere_dados_bulk(tabela_validacao, df_validacao, self.logger)
+            nome_arquivo = f"validacao2_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+            df_validacao.to_csv(nome_arquivo, index=False, encoding="utf-8")
+                
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.insere_dados_bulk(tabela_validacao, df_validacao, self.logger)
+        except Exception as e:
+            self.logger.error(f"Erro na validação de dados para {cliente}: {e}")
+            b = f"Erro na validação de dados para {cliente}:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na Validação", body=b)
+            raise Exception(f"Erro na validação de dados: {e}")

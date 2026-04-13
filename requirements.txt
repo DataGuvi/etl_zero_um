@@ -2,5 +2,6 @@ boto3
 dotenv
 pandas
 psycopg2-binary
+pycryptodome
 redshift_connector
 requests
