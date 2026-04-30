@@ -9,6 +9,7 @@ from database import ConnectionDB
 import logging
 from logging.handlers import RotatingFileHandler
 from send_email import send_email
+from util import Util
 
 class ConsumeAPI:
     def __init__(self, cliente):
@@ -234,7 +235,35 @@ class ConsumeAPI:
             df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
                                         'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm']]
+                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario']]
+            
+            #print("🚨 INICIO DESCRIPTOGRAFIA")
+            #print("ANTES:")
+            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+
+            util = Util()
+
+            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
+
+            for col in colunas_criptografadas:
+                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
+                    lambda x: util.descriptografar("ZEROUM", x)
+                )
+            #print("DEPOIS:")
+            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+
+            df_usuario_ajust['birth_date'] = pd.to_datetime(
+            df_usuario_ajust['birth_date'],
+                format='%d-%m-%Y',
+                errors='coerce'
+            )
+
+            # opcional (recomendado pra banco)
+            #df_usuario_ajust['birth_date'] = df_usuario_ajust['birth_date'].dt.strftime('%Y-%m-%d')
+
+
+            #print("🚨 FIM DESCRIPTOGRAFIA")
+
             df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizador.value, data_inicial, 0)
             df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
             df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_UsuariosTotalizadorBet.value, data_inicial, 0)
@@ -463,7 +492,41 @@ class ConsumeAPI:
             df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
                                         'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm']]
+                                        'last_withdraw_date','last_withdraw_amount', 'utm',  'status_usuario']]
+            
+            
+            #print("🚨 INICIO DESCRIPTOGRAFIA")
+            #print("ANTES:")
+            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+
+            util = Util()
+
+            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
+
+            for col in colunas_criptografadas:
+                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
+                    lambda x: util.descriptografar("ENERGIABET", x)
+                )
+            #print("DEPOIS:")
+            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+
+            df_usuario_ajust['birth_date'] = pd.to_datetime(
+            df_usuario_ajust['birth_date'],
+                format='%d-%m-%Y',
+                errors='coerce'
+            )
+
+            # opcional (recomendado pra banco)
+            #df_usuario_ajust['birth_date'] = df_usuario_ajust['birth_date'].dt.strftime('%Y-%m-%d')
+
+
+            #print("🚨 FIM DESCRIPTOGRAFIA")
+            
+            
+            
+            
+            
+            
             df_usuario_totalizador = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizador.value, data_inicial, 0)
             df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
             df_usuario_totalizador_bet = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_UsuariosTotalizadorBet.value, data_inicial, 0)
