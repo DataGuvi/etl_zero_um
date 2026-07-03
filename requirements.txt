@@ -1,7 +1,8 @@
-boto3
-dotenv
-pandas
-psycopg2-binary
-pycryptodome
-redshift_connector
-requests
+numpy==2.5.0
+pandas==3.0.3
+psycopg2_binary==2.9.12
+pycryptodome==3.23.0
+python-dotenv==1.2.2
+redshift_connector==2.1.13
+Requests==2.34.2
+SQLAlchemy==2.0.51
