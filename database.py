@@ -4,21 +4,59 @@ import redshift_connector
 import pandas as pd
 from urllib.parse import quote_plus
 from datetime import datetime, timedelta, date
-from config import DB_HOST, DB_PORT, DB_NAME_ZEROUM, DB_NAME_ENERGIABET, DB_USER, DB_PASS, DB_SCHEMA 
+from config import (
+    DB_HOST,
+    DB_PORT,
+    DB_NAME_ZEROUM,
+    DB_NAME_ENERGIABET,
+    DB_USER,
+    DB_PASS,
+    DB_SCHEMA,
+    DB_NAME_ZRO_1_BET_ADTK,
+    DB_HOST_ZRO_1_BET_ADTK,
+    DB_PORT_ZRO_1_BET_ADTK,
+    DB_USER_ZRO_1_BET_ADTK,
+    DB_PASS_ZRO_1_BET_ADTK
+)
+import numpy as np
 
 
 class ConnectionDB:
     def conecta(banco: str, cliente: str):
             global cur
             global conn
-            usuario = quote_plus(DB_USER)
-            senha = quote_plus(DB_PASS)
+            
 
             DB_NAME = DB_NAME_ZEROUM if cliente == 'ZEROUM' else DB_NAME_ENERGIABET
 
+            host = DB_HOST
+            port = DB_PORT
+            user = DB_USER
+            password = DB_PASS
+
+                     
+
+             # ZRO_1_BET (novo PostgreSQL - informação de afiliados)
+            if cliente == "ZRO_1_BET":
+                DB_NAME = DB_NAME_ZRO_1_BET_ADTK
+                host = DB_HOST_ZRO_1_BET_ADTK
+                port = DB_PORT_ZRO_1_BET_ADTK
+                user = DB_USER_ZRO_1_BET_ADTK
+                password = DB_PASS_ZRO_1_BET_ADTK
+
+            usuario = quote_plus(user)
+            senha = quote_plus(password)
+
+
             if(banco == 'postgres'):
-                url = f"postgresql://{usuario}:{senha}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+                #url = f"postgresql://{usuario}:{senha}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+                url = f"postgresql://{usuario}:{senha}@{host}:{port}/{DB_NAME}"
                 print("url", url)
+                print("Cliente:", cliente)
+                print("Host:", host)
+                print("Port:", port)
+                print("Database:", DB_NAME)
+                print("User:", user)
                 conn = psycopg2.connect(url)
             elif(banco == 'redshift'):
                 conn = psycopg2.connect(
@@ -31,6 +69,7 @@ class ConnectionDB:
             conn.autocommit = False
             cur = conn.cursor()
             print('conexao com o bd realizada')
+            return conn
 
     def insere_dados(tabela: str, id: str, dados: dict) -> int:
         print("salva no banco")
@@ -46,7 +85,7 @@ class ConnectionDB:
 
         return id
     
-    def insere_dados_bulk(tabela: str, df: pd.DataFrame, logger):
+    def insere_dados_bulk(tabela: str, df: pd.DataFrame, logger, normalize_numpy=False):
         try:
             print("salva no banco")
 
@@ -54,7 +93,14 @@ class ConnectionDB:
             #placeholders = ', '.join(['%s'] * len(df.columns))
             #sql = f"INSERT INTO {tabela} ({colunas}) VALUES ({placeholders})"
             sql = f"INSERT INTO {tabela} ({colunas}) VALUES %s"
-            dados = [tuple(row) for row in df.values]
+            #dados = [tuple(row) for row in df.values]
+            if normalize_numpy:
+                dados = [
+                    tuple(x.item() if hasattr(x, "item") else x for x in row)
+                    for row in df.to_numpy()
+                ]
+            else:
+                dados = [tuple(row) for row in df.values]
 
             logger.info(f"Inserindo {len(dados)} linhas na tabela {tabela}")
             print(f"Inserindo {len(dados)} linhas... as {datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -177,6 +223,39 @@ class ConnectionDB:
                 conn.rollback()
             logger.info(f"Erro ao executar o script: {e}")
             print(f"Erro ao executar o script: {e}")
+            raise
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+    
+    def executa_dml(script: str, logger) -> int:
+        """
+        Executa um statement DML (INSERT, UPDATE, DELETE, MERGE, TRUNCATE).
+        Diferente de executa_script (que usa pd.read_sql e é para SELECT),
+        este método usa cur.execute diretamente e faz commit.
+ 
+        Retorna o número de linhas afetadas (cur.rowcount).
+        """
+        try:
+            logger.info("Executando DML.")
+            print("Executando DML.")
+ 
+            cur.execute(script)
+            linhas = cur.rowcount
+            conn.commit()
+ 
+            logger.info(f"DML executado com sucesso. Linhas afetadas: {linhas}")
+            print(f"DML executado. Linhas afetadas: {linhas}")
+ 
+            return linhas
+ 
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"Erro ao executar DML: {e}")
+            print(f"Erro ao executar DML: {e}")
             raise
         finally:
             if cur:

@@ -10,9 +10,18 @@ import logging
 from logging.handlers import RotatingFileHandler
 from send_email import send_email
 from util import Util
+import os
+from sqlalchemy import create_engine
+from sqlalchemy import text
+import psycopg2
+from agregacao_dim_usuario import executar_agregacao_dim_usuario
+from db_logger import DBLogger
+from agregacao_cohort_retencao import executar_agregacao_cohort_retencao, executar_kpi_diario_datatalk
 
 class ConsumeAPI:
-    def __init__(self, cliente):
+    def __init__(self, cliente,  modo="incremental"):
+        self.engine_zro1bet = self.create_engine_zro1bet()
+        self.engine_dw = self.create_engine_dw()
         handler = RotatingFileHandler(
             'etl.log', 
             maxBytes=10*1024*1024,  # 10MB
@@ -25,6 +34,7 @@ class ConsumeAPI:
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(handler)
         logging.basicConfig(handlers=[handler], level=logging.INFO)
+        self.db_logger = DBLogger(cliente=cliente)
         if cliente == 'ZEROUM':
             self.principal_zeroum()
         elif cliente == 'ZEROUM_VALIDACAO':
@@ -35,11 +45,23 @@ class ConsumeAPI:
             self.valida_dados('ENERGIABET')
         elif cliente == 'sobe_dados':
             self.sobe_dados()
+        elif cliente == 'ZRO_1_BET':
+            self.principal_zro_1_bet(modo=modo)
         else:
             self.logger.error("Cliente inválido")
 
+    def get_log_history(self, linhas: int = 50) -> str:
+        """Lê as últimas N linhas do etl.log para compor o body dos e-mails de erro."""
+        try:
+            with open('etl.log', 'r', encoding='latin-1') as f:
+                todas = f.readlines()
+                return "".join(todas[-linhas:])
+        except Exception as e:
+            return f"(não foi possível ler o etl.log: {e})"
+
     def principal_zeroum(self):
         try:
+            start_time = datetime.now()
             #data_final = "2026-02-25T00:00:00"
             #while data_final < "2026-03-07T00:00:00":
             #print("atualizando as datas")
@@ -293,14 +315,54 @@ class ConsumeAPI:
             ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
             ConnectionDB.conecta(DB, 'ZEROUM')
             ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
-        except requests.exceptions.RequestException as e:
+
+            executar_agregacao_dim_usuario(
+            df_list=[
+                    df_stg,
+                    df_deposito,
+                    df_saque,
+                    df_primeira_aposta,
+                    df_ultima_aposta,
+                    df_bonus,
+                    df_bonus_ativado,
+                    df_stg_sport
+                ],
+                cliente='ZEROUM',
+                db=DB,
+                logger=self.logger
+            )
+
+            executar_agregacao_cohort_retencao('ZEROUM', DB, self.logger)
+            executar_kpi_diario_datatalk('ZEROUM', DB, self.logger)
+
+            self.db_logger.log_operation(
+                operation='ETL_ZEROUM',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente='ZEROUM'
+            )
+
+        except Exception as e:
             self.logger.error(f"Erro na execução do ETL ZEROUM: {e}")
-            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            self.db_logger.log_operation(
+                operation='ETL_ZEROUM',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente='ZEROUM'
+            )
+            b = (
+                f"Descrição do erro: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
             send_email(subject="[FALHA ENGENHARIA] ZeroUm - Erro na execução do ETL", body=b)
-            raise Exception(f"Erro na execução do ETL: {e}")
+            raise
         
     def principal_energiabet(self):
         try:
+            start_time = datetime.now()
             #data_final = "2026-03-25T00:00:00"
             #while data_final < "2026-03-31T00:00:00":
             #print("atualizando as datas")
@@ -551,33 +613,192 @@ class ConsumeAPI:
             ConnectionDB.insere_dados_bulk('inplay.stg_usuario', df_dim_usuario, self.logger)
             ConnectionDB.conecta(DB, 'ENERGIABET')
             ConnectionDB.mergeia_dados('inplay.stg_usuario', 'inplay.dim_usuario', df_dim_usuario, ['id'], self.logger)
-        except requests.exceptions.RequestException as e:
+
+            self.db_logger.log_operation(
+                operation='ETL_ENERGIABET',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente='ENERGIABET'
+            )
+
+        except Exception as e:
             self.logger.error(f"Erro na execução do ETL ENERGIABET: {e}")
-            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            self.db_logger.log_operation(
+                operation='ETL_ENERGIABET',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente='ENERGIABET'
+            )
+            b = (
+                f"Descrição do erro: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
             send_email(subject="[FALHA ENGENHARIA] EnergiaBet - Erro na execução do ETL", body=b)
-            raise Exception(f"Erro na execução do ETL: {e}")
+            raise
         
     
+    def principal_zro_1_bet(self, modo="incremental"):
+        start_time = datetime.now()
+        try:
+            self.logger.info(f"Iniciando carga ZRO_1_BET - {modo}")
+
+            df = self.extrair_zro_1_bet(
+                modo="historico" if modo == "historico" else "incremental"
+            )
+
+            df = self.validar_vendas_data(df)
+
+            self.carregar_stg_vendas_data(df)
+
+            self.carregar_fct_vendas_data()
+
+            self.logger.info("Carga ZRO_1_BET finalizada")
+
+            self.db_logger.log_operation(
+                operation='ETL_ZRO_1_BET',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente='ZRO_1_BET'
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro na execução do ETL ZRO_1_BET: {e}")
+            self.db_logger.log_operation(
+                operation='ETL_ZRO_1_BET',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente='ZRO_1_BET'
+            )
+            b = (
+                f"Descrição do erro: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
+            send_email(subject="[FALHA ENGENHARIA] ZRO_1_BET - Erro na execução do ETL", body=b)
+            raise
+
     def conection(self, cliente):
         id = ''
         try:
-            self.auth_url = API_AUTH
-            self.body = {
-                "username": API_USER_ZEROUM if cliente == 'ZEROUM' else API_USER_ENERGIABET,
-                "password": API_PASS_ZEROUM if cliente == 'ZEROUM' else API_PASS_ENERGIABET
-            }
 
-            response = requests.post(self.auth_url, json=self.body)
+            # =========================================================
+            # 🔹 NOVO CLIENTE - POSTGRESQL
+            # =========================================================
+            if cliente == 'ZRO_1_BET':
+                try:
+                    self.logger.info("Iniciando conexão PostgreSQL - ZRO_1_BET")
 
-            print("requisição realizada")
-            id = response.json()['id']
+                     # 🔥 SEGURANÇA: garante que o engine existe
+                    if not hasattr(self, "engine_zro1bet"):
+                        raise Exception("engine_zro1bet não foi inicializado no __init__")
+
+
+                    #conn = self.engine_zro1bet.connect()
+                    conn = psycopg2.connect(
+                        host=os.getenv("DB_HOST_ZRO_1_BET_ADTK"),
+                        port=os.getenv("DB_PORT_ZRO_1_BET_ADTK"),
+                        dbname=os.getenv("DB_NAME_ZRO_1_BET_ADTK"),
+                        user=os.getenv("DB_USER_ZRO_1_BET_ADTK"),
+                        password=os.getenv("DB_PASS_ZRO_1_BET_ADTK")
+                    )
+                    #conn.execute(text("SELECT 1"))
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+                    self.logger.info("Conexão PostgreSQL ZRO_1_BET estabelecida com sucesso")
+
+                    return conn
+
+                except Exception as e:
+                    self.logger.error(f"Erro na conexão PostgreSQL ZRO_1_BET: {e}")
+                    # e-mail não enviado aqui — principal_zro_1_bet captura e envia
+                    # um único e-mail completo com histórico de log
+                    raise Exception(f"Erro ao conectar no PostgreSQL ZRO_1_BET: {e}")
+                                
+                     
+
+
+            # =========================================================
+            # 🔹 CLIENTES API
+            # =========================================================
+            elif cliente == 'ZEROUM' or cliente == 'ENERGIABET':
+
+                self.auth_url = API_AUTH
+
+                self.body = {
+                    "username": API_USER_ZEROUM if cliente == 'ZEROUM' else API_USER_ENERGIABET,
+                    "password": API_PASS_ZEROUM if cliente == 'ZEROUM' else API_PASS_ENERGIABET
+                }
+
+                response = requests.post(self.auth_url, json=self.body)
+
+                print("requisição realizada")
+
+                id = response.json()['id']
+
+            # =========================================================
+            # 🔹 CLIENTE INVÁLIDO
+            # =========================================================
+            else:
+                raise Exception(f"Cliente inválido: {cliente}")
+
         except requests.exceptions.RequestException as e:
+            # captura APENAS erros HTTP do requests.post() de ZEROUM/ENERGIABET
+            # erros de psycopg2 do ZRO_1_BET propagam direto para principal_zro_1_bet
             self.logger.error(f"Erro na autenticação da API: {e}")
-            b = f"Ocorreu um erro na autenticação da API.\n\nDescrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
-            send_email(subject="[FALHA ENGENHARIA] API - Erro na autenticação", body=b)
-            raise Exception(f"Erro ao conectar na API: {e}")
+
+            b = (
+                f"Ocorreu um erro na autenticação da API: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
+
+            send_email(
+                subject="[FALHA ENGENHARIA] API - Erro na autenticação",
+                body=b
+            )
+
+            raise
+
         return id
-        
+
+    
+
+    def create_engine_zro1bet(self):
+
+        host = os.getenv("DB_HOST_ZRO_1_BET_ADTK")
+        port = os.getenv("DB_PORT_ZRO_1_BET_ADTK")
+        db   = os.getenv("DB_NAME_ZRO_1_BET_ADTK")
+        user = os.getenv("DB_USER_ZRO_1_BET_ADTK")
+        password = os.getenv("DB_PASS_ZRO_1_BET_ADTK")
+
+        url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+
+        return create_engine(url)
+
+
+    def create_engine_dw(self):
+
+        host = os.getenv("DB_HOST")
+        port = os.getenv("DB_PORT")
+        db = os.getenv("DB_NAME_ZEROUM")
+        user = os.getenv("DB_USER")
+
+        print("DW HOST:", host)
+        print("DW PORT:", port)
+        print("DW DB:", db)
+        print("DW USER:", user)
+
+        password = os.getenv("DB_PASS")
+
+        url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+
+        return create_engine(url)
+
     def extrai_csv(self, auth_id:str, database:int, table:int=0, card:str='', filter:str=None):
         try:
             self.rota = API_ROTA_CSV
@@ -610,11 +831,14 @@ class ConsumeAPI:
             resultado_csv = response.content
             #df = pd.DataFrame(resultado_csv)
             return resultado_csv
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self.logger.error(f"Erro ao extrair CSV da API: {e}")
-            b = f"Ocorreu um erro ao extrair CSV da API.\n\nDescrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            b = (
+                f"Ocorreu um erro ao extrair CSV da API: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
             send_email(subject="[FALHA ENGENHARIA] API - Erro ao extrair CSV", body=b)
-            raise Exception(f"Erro ao conectar na API: {e}")
+            raise
                                                
     def extrai_dados_card(self, auth_id, id_database, id_card, data_inicial, data_final):
         try:
@@ -644,12 +868,528 @@ class ConsumeAPI:
                 csv = self.extrai_csv(auth_id, id_database, 0, id_card, ["between",["field","updated_at",{"base-type":"type/DateTime"}], data_inicial, data_final])
             df = pd.read_csv(io.BytesIO(csv))
             return df
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self.logger.error(f"Erro ao extrair os dados da consulta {id_card}: {e}")
-            b = f"Erro no card {id_card}:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            b = (
+                f"Erro no card {id_card}: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
             send_email(subject=f"[FALHA ENGENHARIA] Metabase - Erro card {id_card}", body=b)
-            raise Exception(f"Erro ao extrair os dados do card {id}: {e}")
+            raise
     
+
+    def extrair_zro_1_bet(self, modo="incremental"):
+        print("1 - antes conexão")
+        conn = self.conection("ZRO_1_BET")
+        print("2 - depois conexão")
+        # histórico vs incremental
+        print("EXECUÇÃO ID:", id(self))
+        print("MODO:", modo)
+        if modo == "historico":
+            query = """
+                SELECT *
+                FROM zro1_bet_adtk.vendas_data
+            """
+        else:
+            query = """
+                SELECT *
+                FROM zro1_bet_adtk.vendas_data
+                WHERE data_criacao >= CURRENT_DATE - INTERVAL '7 days'
+            """
+
+        try:
+            df = pd.read_sql(query, conn)
+        finally:
+            conn.close()
+        print("3 - depois extract")
+        print("\n=== DATAFRAME ===")
+        print(df.head())
+        print("\n=== SHAPE ===")
+        print(df.shape)
+
+        return df
+
+
+    def validar_vendas_data(self, df):
+
+        self.logger.info("Iniciando validação dos dados")
+
+        if "data_criacao" not in df.columns:
+            raise Exception("Coluna data_criacao não encontrada no DataFrame.")
+
+        # garante datetime
+        df["data_criacao"] = pd.to_datetime(
+            df["data_criacao"],
+            errors="coerce"
+        )
+
+        df_rejeitados = df[df["data_criacao"].isna()].copy()
+
+        if not df_rejeitados.empty:
+
+            self.logger.warning(
+                f"{len(df_rejeitados)} registros rejeitados."
+            )
+
+            df_rejeitados["updated_at"] = pd.Timestamp.now()
+            df_rejeitados["import_date"] = pd.Timestamp.now()
+
+            df_rejeitados = df_rejeitados.rename(
+                columns={"tag": "tag_venda"}
+            )
+
+            df_rejeitados["motivo_rejeicao"] = "DATA_CRIACAO_NULA"
+            df_rejeitados["data_rejeicao"] = pd.Timestamp.now()
+
+            self.salvar_rejeitados(df_rejeitados)
+
+        # Mantém apenas válidos
+        df = df[df["data_criacao"].notna()].copy()
+
+        self.logger.info(
+            f"Validação concluída. Registros válidos: {len(df)}"
+        )
+
+        return df
+           
+
+    def salvar_rejeitados(self, df_rejeitados):
+
+        self.logger.info("Salvando registros rejeitados")
+
+        if df_rejeitados.empty:
+            self.logger.info("Nenhum registro rejeitado encontrado.")
+            return
+
+        conn = ConnectionDB.conecta(DB, "ZEROUM")
+
+        try:
+
+            if conn.closed:
+                raise Exception("Conexão fechada.")
+
+            cur = conn.cursor()
+
+            # ==========================================================
+            # 1. LIMPA STG TEMPORÁRIA
+            # ==========================================================
+
+            self.logger.info("Limpando STG de rejeitados")
+
+            cur.execute("""
+                TRUNCATE TABLE inplay.stg_vendas_data_rejeitados_tmp
+            """)
+
+            conn.commit()
+            cur.close()
+
+            # ==========================================================
+            # 2. CARREGA STG TEMPORÁRIA
+            # ==========================================================
+
+            # força todas as colunas datetime virarem object
+            for coluna in df_rejeitados.select_dtypes(include=["datetime64[ns]"]).columns:
+
+                df_rejeitados[coluna] = df_rejeitados[coluna].astype(object)
+
+            df_rejeitados = df_rejeitados.where(
+                pd.notnull(df_rejeitados),
+                None
+            )
+
+
+            print("\n================ DEBUG REJEITADOS ================")
+
+            for coluna in df_rejeitados.columns:
+
+                if "data" in coluna.lower() or "updated" in coluna.lower():
+
+                    print(f"\nColuna: {coluna}")
+                    print("dtype:", df_rejeitados[coluna].dtype)
+                    print("Valor:", repr(df_rejeitados.iloc[0][coluna]))
+                    print("Tipo :", type(df_rejeitados.iloc[0][coluna]))
+
+            print("==================================================\n")
+
+
+            ConnectionDB.insere_dados_bulk(
+                "inplay.stg_vendas_data_rejeitados_tmp",
+                df_rejeitados,
+                self.logger
+            )
+
+            self.logger.info(
+                f"{len(df_rejeitados)} registros inseridos na STG de rejeitados."
+            )
+
+            # insere_dados_bulk fecha a conexão automaticamente.
+            # Reabre para continuar o processamento.
+
+            conn = ConnectionDB.conecta(DB, "ZEROUM")
+
+            if conn.closed:
+                raise Exception("Falha ao reabrir conexão.")
+
+            cur = conn.cursor()
+
+            # ==========================================================
+            # 3. UPDATE DOS REJEITADOS JÁ EXISTENTES
+            # ==========================================================
+
+            self.logger.info("Atualizando rejeitados existentes")
+
+            cur.execute("""
+
+                UPDATE inplay.log_vendas_data_rejeitados l
+                SET
+                    data_criacao      = s.data_criacao,
+                    user_id           = s.user_id,
+                    nome              = s.nome,
+                    sobrenome         = s.sobrenome,
+                    email             = s.email,
+                    telefone          = s.telefone,
+                    data_nascimento   = s.data_nascimento,
+                    endereco          = s.endereco,
+                    cidade            = s.cidade,
+                    estado            = s.estado,
+                    pais              = s.pais,
+                    zipcode           = s.zipcode,
+                    utm_campaign      = s.utm_campaign,
+                    utm_content       = s.utm_content,
+                    utm_medium        = s.utm_medium,
+                    utm_source        = s.utm_source,
+                    utm_term          = s.utm_term,
+                    ad_id             = s.ad_id,
+                    valor             = s.valor,
+                    pagina_origem     = s.pagina_origem,
+                    page_referrer     = s.page_referrer,
+                    status            = s.status,
+                    tag_venda         = s.tag_venda,
+                    tipo              = s.tipo,
+                    utm_id            = s.utm_id,
+                    updated_at        = s.updated_at,
+                    import_date       = s.import_date,
+                    motivo_rejeicao   = s.motivo_rejeicao,
+                    ultima_ocorrencia = s.data_rejeicao,
+                    qtde_rejeicoes    = l.qtde_rejeicoes + 1
+
+                FROM inplay.stg_vendas_data_rejeitados_tmp s
+
+                WHERE l.id_transacao = s.id_transacao;
+
+            """)
+
+            self.logger.info("UPDATE de rejeitados concluído.")
+
+            # ==========================================================
+            # 4. INSERT DOS NOVOS REJEITADOS
+            # ==========================================================
+
+            self.logger.info("Inserindo novos rejeitados")
+
+            cur.execute("""
+
+                INSERT INTO inplay.log_vendas_data_rejeitados
+                (
+                    id_transacao,
+                    data_criacao,
+                    user_id,
+                    nome,
+                    sobrenome,
+                    email,
+                    telefone,
+                    data_nascimento,
+                    endereco,
+                    cidade,
+                    estado,
+                    pais,
+                    zipcode,
+                    utm_campaign,
+                    utm_content,
+                    utm_medium,
+                    utm_source,
+                    utm_term,
+                    ad_id,
+                    valor,
+                    pagina_origem,
+                    page_referrer,
+                    status,
+                    tag_venda,
+                    tipo,
+                    utm_id,
+                    updated_at,
+                    import_date,
+                    motivo_rejeicao,
+                    data_rejeicao,
+                    ultima_ocorrencia,
+                    qtde_rejeicoes
+                )
+
+                SELECT
+                    s.id_transacao,
+                    s.data_criacao,
+                    s.user_id,
+                    s.nome,
+                    s.sobrenome,
+                    s.email,
+                    s.telefone,
+                    s.data_nascimento,
+                    s.endereco,
+                    s.cidade,
+                    s.estado,
+                    s.pais,
+                    s.zipcode,
+                    s.utm_campaign,
+                    s.utm_content,
+                    s.utm_medium,
+                    s.utm_source,
+                    s.utm_term,
+                    s.ad_id,
+                    s.valor,
+                    s.pagina_origem,
+                    s.page_referrer,
+                    s.status,
+                    s.tag_venda,
+                    s.tipo,
+                    s.utm_id,
+                    s.updated_at,
+                    s.import_date,
+                    s.motivo_rejeicao,
+                    s.data_rejeicao,
+                    s.data_rejeicao,
+                    1
+
+                FROM inplay.stg_vendas_data_rejeitados_tmp s
+
+                WHERE NOT EXISTS
+                (
+                    SELECT 1
+                    FROM inplay.log_vendas_data_rejeitados l
+                    WHERE l.id_transacao = s.id_transacao
+                );
+
+            """)
+
+            conn.commit()
+
+            cur.close()
+
+            self.logger.info("Log de rejeitados atualizado com sucesso.")
+
+        except Exception as e:
+
+            try:
+                conn.rollback()
+            except:
+                pass
+
+            self.logger.error(f"Erro ao salvar rejeitados: {e}")
+            raise
+
+        finally:
+
+            if conn:
+                conn.close()       
+
+
+    def carregar_stg_vendas_data(self, df):
+
+        print("A - entrou STG")
+
+        self.logger.info("Carregando STAGE")
+
+        conn = ConnectionDB.conecta(DB, 'ZEROUM')
+
+        print("B - conectou DW")
+
+        if conn is None:
+            raise Exception("Falha ao conectar no DW (ZEROUM)")
+
+        try:
+
+            self.logger.info("Limpando STAGE antes da carga")
+
+            print("C - truncate")
+
+            #conn.cursor().execute("TRUNCATE TABLE inplay.stg_vendas_data")
+            #conn.commit()
+            #if hasattr(ConnectionDB, "cur"):
+            #    ConnectionDB.cur.execute(
+           #         "TRUNCATE TABLE inplay.stg_vendas_data"
+            #    )
+
+            cur = conn.cursor()
+            cur.execute("TRUNCATE TABLE inplay.stg_vendas_data")
+            conn.commit()
+            cur.close() 
+
+            print("C.1 - truncate realizado")
+
+            # -------------------
+            # PREPARA DATAFRAME
+            # -------------------
+
+            df["updated_at"] = pd.Timestamp.now()
+            df["import_date"] = pd.Timestamp.now()
+
+            df = df.rename(columns={"tag": "tag_venda"})
+
+            print("D - antes to_sql")
+            print("Linhas para inserir:", len(df))
+
+            print(df.columns.tolist())
+            print(type(conn))
+
+             # motivo: Redshift antigo NÃO aguenta 669k em um único execute_values
+
+            #chunk_size = 5000  # equilíbrio entre performance e estabilidade
+
+            #print(f"Inserindo em batches de {chunk_size} linhas...")
+
+            #for i in range(0, len(df), chunk_size):
+
+            #    chunk = df.iloc[i:i + chunk_size]
+
+            #    ConnectionDB.insere_dados_bulk(
+            #        "inplay.stg_vendas_data",
+            #        chunk,
+            #        self.logger
+            #    )
+
+           #     print(f"Batch {i} → {i + len(chunk)} inserido")
+
+            #print("E - insert finalizado")
+
+            #self.logger.info("STAGE carregada com sucesso")
+            if conn.closed:
+                raise Exception("Conexão foi fechada antes do insert")
+            
+            ConnectionDB.insere_dados_bulk(
+                "inplay.stg_vendas_data",
+                df,
+                self.logger
+            )
+
+            print("E - depois to_sql")
+
+            self.logger.info("STAGE carregada com sucesso")
+
+        except Exception as e:
+
+            self.logger.error(
+                f"Erro ao carregar STAGE: {e}"
+            )
+
+            raise
+
+        finally:
+
+            if conn:
+                conn.close()
+
+            print("F - conexão fechada")
+
+            self.logger.info(
+                "Conexão da STAGE fechada"
+            )
+
+    def carregar_fct_vendas_data(self):
+
+        self.logger.info("Carregando FACT (UPDATE + INSERT)")
+
+        conn = ConnectionDB.conecta(DB, 'ZEROUM')
+
+        try:
+
+            if conn.closed:
+                raise Exception("Conexão fechada antes da execução da FACT")
+
+            cur = conn.cursor()
+
+            try:
+                # ==========================================
+                # UPDATE DOS REGISTROS EXISTENTES
+                # ==========================================
+
+                query_update = """
+                    UPDATE inplay.fact_vendas_data f
+                    SET
+                        user_id = s.user_id,
+                        nome = s.nome,
+                        sobrenome = s.sobrenome,
+                        email = s.email,
+                        telefone = s.telefone,
+                        data_nascimento = s.data_nascimento,
+                        endereco = s.endereco,
+                        cidade = s.cidade,
+                        estado = s.estado,
+                        pais = s.pais,
+                        zipcode = s.zipcode,
+                        utm_campaign = s.utm_campaign,
+                        utm_content = s.utm_content,
+                        utm_medium = s.utm_medium,
+                        utm_source = s.utm_source,
+                        utm_term = s.utm_term,
+                        ad_id = s.ad_id,
+                        valor = s.valor,
+                        pagina_origem = s.pagina_origem,
+                        page_referrer = s.page_referrer,
+                        status = s.status,
+                        tag_venda = s.tag_venda,
+                        tipo = s.tipo,
+                        utm_id = s.utm_id,
+                        updated_at = s.updated_at,
+                        import_date = s.import_date
+                    FROM inplay.stg_vendas_data s
+                    WHERE
+                        f.id_transacao = s.id_transacao
+                    AND f.data_criacao = s.data_criacao;
+                """
+
+                cur.execute(query_update)
+
+                self.logger.info("UPDATE realizado")
+
+                # ==========================================
+                # INSERE APENAS NOVOS REGISTROS
+                # ==========================================
+
+                query_insert = """
+                    INSERT INTO inplay.fact_vendas_data
+                    SELECT s.*
+                    FROM inplay.stg_vendas_data s
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM inplay.fact_vendas_data f
+                        WHERE f.id_transacao = s.id_transacao
+                        AND f.data_criacao = s.data_criacao
+                    );
+                """
+
+                cur.execute(query_insert)
+
+                conn.commit()
+
+            finally:
+                cur.close()
+
+            self.logger.info("FACT carregada com sucesso")
+
+        except Exception as e:
+
+            try:
+                conn.rollback()
+            except:
+                pass
+
+            self.logger.error(f"Erro ao carregar FACT: {e}")
+            raise
+
+        finally:
+            if conn:
+                conn.close()
+
+
     def sobe_dados(self):
         df = pd.read_csv('jogos_jogador.csv', sep=';', header=0)
 
@@ -663,6 +1403,7 @@ class ConsumeAPI:
            
     def valida_dados(self, cliente: str):
         try:
+            start_time = datetime.now()
             print('função para validar os dados da base')
             self.logger.info("Iniciando o processo de validação dos dados")
             df_validacao = pd.DataFrame()
@@ -804,8 +1545,28 @@ class ConsumeAPI:
                 
             ConnectionDB.conecta(DB, cliente)
             ConnectionDB.insere_dados_bulk(tabela_validacao, df_validacao, self.logger)
+
+            self.db_logger.log_operation(
+                operation=f'VALIDACAO_{cliente}',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
         except Exception as e:
             self.logger.error(f"Erro na validação de dados para {cliente}: {e}")
-            b = f"Erro na validação de dados para {cliente}:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            self.db_logger.log_operation(
+                operation=f'VALIDACAO_{cliente}',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = (
+                f"Erro na validação de dados para {cliente}: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
             send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na Validação", body=b)
-            raise Exception(f"Erro na validação de dados: {e}")
+            raise
