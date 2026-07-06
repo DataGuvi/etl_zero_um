@@ -885,14 +885,48 @@ class ConsumeAPI:
         # histórico vs incremental
         print("EXECUÇÃO ID:", id(self))
         print("MODO:", modo)
+        # Lista explícita de colunas: evita que uma alteração na estrutura da
+        # tabela de origem (ex.: novas colunas) quebre o ETL em produção.
+        # Se uma coluna nova for adicionada na origem e for necessária no DW,
+        # ela precisa ser incluída aqui manualmente.
+        colunas_origem = """
+                id_transacao,
+                data_criacao,
+                user_id,
+                nome,
+                sobrenome,
+                email,
+                telefone,
+                data_nascimento,
+                endereco,
+                cidade,
+                estado,
+                pais,
+                zipcode,
+                utm_campaign,
+                utm_campaign_checkout,
+                utm_content,
+                utm_medium,
+                utm_source,
+                utm_term,
+                utm_id,
+                ad_id,
+                valor,
+                pagina_origem,
+                page_referrer,
+                status,
+                tag,
+                tipo
+        """
+
         if modo == "historico":
-            query = """
-                SELECT *
+            query = f"""
+                SELECT {colunas_origem}
                 FROM zro1_bet_adtk.vendas_data
             """
         else:
-            query = """
-                SELECT *
+            query = f"""
+                SELECT {colunas_origem}
                 FROM zro1_bet_adtk.vendas_data
                 WHERE data_criacao >= CURRENT_DATE - INTERVAL '7 days'
             """
@@ -1055,6 +1089,7 @@ class ConsumeAPI:
                     pais              = s.pais,
                     zipcode           = s.zipcode,
                     utm_campaign      = s.utm_campaign,
+                    utm_campaign_checkout = s.utm_campaign_checkout,
                     utm_content       = s.utm_content,
                     utm_medium        = s.utm_medium,
                     utm_source        = s.utm_source,
@@ -1105,6 +1140,7 @@ class ConsumeAPI:
                     pais,
                     zipcode,
                     utm_campaign,
+                    utm_campaign_checkout,
                     utm_content,
                     utm_medium,
                     utm_source,
@@ -1140,6 +1176,7 @@ class ConsumeAPI:
                     s.pais,
                     s.zipcode,
                     s.utm_campaign,
+                    s.utm_campaign_checkout,
                     s.utm_content,
                     s.utm_medium,
                     s.utm_source,
@@ -1326,6 +1363,7 @@ class ConsumeAPI:
                         pais = s.pais,
                         zipcode = s.zipcode,
                         utm_campaign = s.utm_campaign,
+                        utm_campaign_checkout = s.utm_campaign_checkout,
                         utm_content = s.utm_content,
                         utm_medium = s.utm_medium,
                         utm_source = s.utm_source,

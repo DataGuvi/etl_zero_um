@@ -178,6 +178,141 @@ SQL_MERGE_COHORT_ATIVIDADE = """
 
 
 # =============================================================================
+# PASSO 1b: RETENÇÃO POR JANELA (D1/D7/D30/D60/D90) -- grão correto
+#
+# NÃO deriva de agg_cohort_atividade_diaria por SUM() dos dias da janela --
+# isso duplicaria usuário ativo em mais de um dia dentro da mesma janela.
+# Reusa exatamente o mesmo escopo (cohorts_afetadas/cohort_base/atividade) do
+# Passo 1, só troca o GROUP BY de "por dia" para "por janela", com
+# COUNT(DISTINCT usuario) direto na fonte -- sem risco de contagem duplicada.
+# =============================================================================
+
+SQL_STG_COHORT_RETENCAO_JANELA = """
+    INSERT INTO inplay.stg_agg_cohort_retencao_janela (
+        data_ftd, janela_retencao, dias_janela, usuarios_cohort, usuarios_retidos, ltv_dia, updated_at
+    )
+    WITH usuario_ftd_resolvido AS (
+        SELECT
+            du.id AS usuario,
+            COALESCE(
+                CASE
+                    WHEN du.first_deposit_date::date = DATE '1970-01-01'
+                    THEN am.primeira_data_deposito_fato
+                    ELSE du.first_deposit_date::date
+                END,
+                DATE '1970-01-01'
+            ) AS data_ftd
+        FROM inplay.dim_usuario du
+        LEFT JOIN inplay.agg_usuario_metricas am
+               ON du.id = am.usuario
+    ),
+    cohorts_afetadas AS (
+        SELECT DISTINCT r.data_ftd
+        FROM usuario_ftd_resolvido r
+        WHERE r.usuario IN (SELECT usuario FROM inplay.stg_usuarios_impactados)
+          AND r.data_ftd IS NOT NULL
+          AND r.data_ftd <> DATE '1970-01-01'
+          AND r.data_ftd >= CURRENT_DATE - 90
+    ),
+    cohort_base AS (
+        SELECT
+            r.usuario,
+            r.data_ftd
+        FROM usuario_ftd_resolvido r
+        JOIN cohorts_afetadas c
+          ON c.data_ftd = r.data_ftd
+    ),
+    cohort_tamanho AS (
+        SELECT
+            data_ftd,
+            COUNT(DISTINCT usuario) AS usuarios_cohort
+        FROM cohort_base
+        GROUP BY data_ftd
+    ),
+    atividade AS (
+        SELECT
+            f.id_usuario,
+            f.data,
+            COALESCE(f.ggr, 0) AS ggr,
+            f.usuario_ativo
+        FROM inplay.fact_user_atividade_diaria f
+        WHERE f.id_usuario IN (SELECT usuario FROM cohort_base)
+    ),
+    retencao_janela AS (
+        SELECT
+            cb.data_ftd,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 'D1'
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 'D7'
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 'D30'
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 'D60'
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 'D90'
+            END AS janela_retencao,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 1
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 7
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 30
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 60
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 90
+            END AS dias_janela,
+            -- COUNT(DISTINCT usuario) por janela inteira -- cada usuario
+            -- conta 1 vez, não importa em quantos dias da janela ele
+            -- esteve ativo
+            COUNT(DISTINCT CASE WHEN a.usuario_ativo THEN a.id_usuario END) AS usuarios_retidos,
+            SUM(a.ggr) AS ltv_dia
+        FROM cohort_base cb
+        JOIN atividade a
+          ON cb.usuario = a.id_usuario
+         AND a.data >= cb.data_ftd
+         AND (a.data - cb.data_ftd) BETWEEN 1 AND 90
+        GROUP BY
+            cb.data_ftd,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 'D1'
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 'D7'
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 'D30'
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 'D60'
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 'D90'
+            END,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 1
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 7
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 30
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 60
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 90
+            END
+    )
+    SELECT
+        r.data_ftd,
+        r.janela_retencao,
+        r.dias_janela,
+        ct.usuarios_cohort,
+        r.usuarios_retidos,
+        r.ltv_dia,
+        CURRENT_DATE AS updated_at
+    FROM retencao_janela r
+    JOIN cohort_tamanho ct
+      ON ct.data_ftd = r.data_ftd
+    WHERE r.janela_retencao IS NOT NULL
+"""
+
+SQL_MERGE_COHORT_RETENCAO_JANELA = """
+    DELETE FROM inplay.agg_cohort_retencao_janela
+    USING (
+        SELECT DISTINCT data_ftd FROM inplay.stg_agg_cohort_retencao_janela
+    ) s
+    WHERE inplay.agg_cohort_retencao_janela.data_ftd = s.data_ftd;
+
+    INSERT INTO inplay.agg_cohort_retencao_janela (
+        data_ftd, janela_retencao, dias_janela, usuarios_cohort, usuarios_retidos, ltv_dia, updated_at
+    )
+    SELECT
+        data_ftd, janela_retencao, dias_janela, usuarios_cohort, usuarios_retidos, ltv_dia, updated_at
+    FROM inplay.stg_agg_cohort_retencao_janela;
+"""
+
+
+# =============================================================================
 # PASSO 2: SNAPSHOT DIÁRIO DOS INDICADORES DO DATATALK
 # Roda 1x/dia (não a cada carga incremental). Espelha a lógica de
 # vw_kpi_diario_jogadores_datatalk, mas grava histórico e lê, onde já dá,
@@ -332,8 +467,10 @@ SQL_INSERT_KPI_DIARIO = """
 
 def executar_agregacao_cohort_retencao(cliente: str, db: str, logger):
     """
-    Atualiza inplay.agg_cohort_atividade_diaria, escopado às cohorts (data_ftd)
-    afetadas pela carga atual.
+    Atualiza inplay.agg_cohort_atividade_diaria (grão diário) e
+    inplay.agg_cohort_retencao_janela (grão por janela D1/D7/D30/D60/D90,
+    com COUNT DISTINCT correto), escopado às cohorts (data_ftd) afetadas
+    pela carga atual.
 
     IMPORTANTE: deve ser chamada logo após executar_agregacao_dim_usuario()
     na mesma execução, pois depende de inplay.stg_usuarios_impactados e
@@ -353,6 +490,18 @@ def executar_agregacao_cohort_retencao(cliente: str, db: str, logger):
         logger.info("[COHORT] Merge (delete+insert por cohort) agg_cohort_atividade_diaria")
         ConnectionDB.conecta(db, cliente)
         ConnectionDB.executa_dml(SQL_MERGE_COHORT_ATIVIDADE, logger)
+
+        logger.info("[COHORT] Limpando stg_agg_cohort_retencao_janela")
+        ConnectionDB.conecta(db, cliente)
+        ConnectionDB.deleta_dados('inplay.stg_agg_cohort_retencao_janela', '', logger)
+
+        logger.info("[COHORT] Populando stg_agg_cohort_retencao_janela")
+        ConnectionDB.conecta(db, cliente)
+        ConnectionDB.executa_dml(SQL_STG_COHORT_RETENCAO_JANELA, logger)
+
+        logger.info("[COHORT] Merge (delete+insert por cohort) agg_cohort_retencao_janela")
+        ConnectionDB.conecta(db, cliente)
+        ConnectionDB.executa_dml(SQL_MERGE_COHORT_RETENCAO_JANELA, logger)
 
         logger.info("[COHORT] Atualização concluída com sucesso")
 

@@ -1,7 +1,7 @@
 """
 backfill_agg_cohort_atividade_diaria.py
 =========================================
-Carga histórica ÚNICA (backfill) de inplay.agg_cohort_atividade_diaria.
+Carga histórica de inplay.agg_cohort_atividade_diaria.
 
 ESCOPO: cliente ZEROUM apenas.
 
@@ -10,26 +10,28 @@ que só processa cohorts (data_ftd) de usuarios impactados na carga do dia E
 dentro da janela de 90 dias, este script processa TODO o histórico de
 usuarios com FTD já resolvido.
 
+SEGURO PARA RODAR COM A CARGA INCREMENTAL JÁ ATIVA EM PRODUÇÃO: cada lote
+mensal faz DELETE (só daquele intervalo de data_ftd) + INSERT, exatamente
+como o processo incremental já faz por cohort -- não existe mais um
+TRUNCATE geral no início. Isso significa que não importa a ordem em que este
+script e a carga incremental de hora em hora escrevem: o último a escrever
+um determinado data_ftd deixa o dado correto, sem duplicar nem apagar dado
+de outro mês por engano. Não é necessário pausar o agendamento para rodar
+isto.
+
 RODA EM LOTES MENSAIS (não tudo de uma vez) porque fact_user_atividade_diaria
-tem ~30 milhões de linhas hoje -- um único INSERT cobrindo todo o histórico
-arriscaria estourar tempo/memória num cluster pequeno. Cada mês de cohort
-(data_ftd) é processado e commitado separadamente, com log de progresso.
-Isso também torna o processo RETOMÁVEL: se cair no meio, rode de novo com
---resume que ele pula os meses que já têm dado carregado.
-
-Rodar UMA ÚNICA VEZ, manualmente, NESTA ORDEM:
-    1. ddl_agg_cohort_retencao_kpi.sql               (cria as tabelas)
-    2. este script                                    (popula o histórico)
-    3. views_atualizadas_cohort_retencao_kpi.sql       (cria as views do BI)
-    4. ligar as chamadas em consume_api.py             (mantém tudo atualizado
-                                                         a partir daí)
-
-Pré-requisito: inplay.agg_usuario_metricas precisa já estar populada para
-todo o histórico de usuarios.
+tem ~30 milhões de linhas -- um único INSERT cobrindo todo o histórico
+arriscaria estourar tempo/memória num cluster pequeno. Cada mês é processado
+e commitado separadamente, com log de progresso.
 
 Uso:
-    python backfill_agg_cohort_atividade_diaria.py            # carga do zero
-    python backfill_agg_cohort_atividade_diaria.py --resume   # retomar após falha
+    python backfill_agg_cohort_atividade_diaria.py            # todos os meses
+    python backfill_agg_cohort_atividade_diaria.py --resume   # pula meses que
+                                                                # já têm dado
+                                                                # (só ganho de
+                                                                # tempo, não é
+                                                                # mais necessário
+                                                                # por segurança)
 """
 
 import argparse
@@ -49,10 +51,6 @@ def _primeiro_dia_mes_seguinte(d: date) -> date:
         return date(d.year + 1, 1, 1)
     return date(d.year, d.month + 1, 1)
 
-
-SQL_TRUNCATE = """
-    TRUNCATE TABLE inplay.agg_cohort_atividade_diaria
-"""
 
 SQL_MIN_MAX_DATA_FTD = """
     SELECT
@@ -85,6 +83,18 @@ SQL_CHECK_MES_JA_CARREGADO = """
 # {inicio} e {fim} são strings 'YYYY-MM-DD' formatadas em Python -- não vêm
 # de input do usuário, são geradas internamente a partir de um range de
 # datas, então não há risco de SQL injection aqui.
+SQL_DELETE_MES = """
+    DELETE FROM inplay.agg_cohort_atividade_diaria
+    WHERE data_ftd >= DATE '{inicio}'
+      AND data_ftd <  DATE '{fim}'
+"""
+
+SQL_DELETE_MES_JANELA = """
+    DELETE FROM inplay.agg_cohort_retencao_janela
+    WHERE data_ftd >= DATE '{inicio}'
+      AND data_ftd <  DATE '{fim}'
+"""
+
 SQL_BACKFILL_COHORT_ATIVIDADE_MES = """
     INSERT INTO inplay.agg_cohort_atividade_diaria (
         data_ftd, dias_desde_ftd, usuarios_cohort, usuarios_ativos, ggr_dia, updated_at
@@ -160,6 +170,104 @@ SQL_BACKFILL_COHORT_ATIVIDADE_MES = """
       ON ct.data_ftd = r.data_ftd
 """
 
+SQL_BACKFILL_COHORT_RETENCAO_JANELA_MES = """
+    INSERT INTO inplay.agg_cohort_retencao_janela (
+        data_ftd, janela_retencao, dias_janela, usuarios_cohort, usuarios_retidos, ltv_dia, updated_at
+    )
+    WITH usuario_ftd_resolvido AS (
+        SELECT
+            du.id AS usuario,
+            COALESCE(
+                CASE
+                    WHEN du.first_deposit_date::date = DATE '1970-01-01'
+                    THEN am.primeira_data_deposito_fato
+                    ELSE du.first_deposit_date::date
+                END,
+                DATE '1970-01-01'
+            ) AS data_ftd
+        FROM inplay.dim_usuario du
+        LEFT JOIN inplay.agg_usuario_metricas am
+               ON du.id = am.usuario
+    ),
+    cohort_base AS (
+        SELECT usuario, data_ftd
+        FROM usuario_ftd_resolvido
+        WHERE data_ftd >= DATE '{inicio}'
+          AND data_ftd <  DATE '{fim}'
+    ),
+    cohort_tamanho AS (
+        SELECT
+            data_ftd,
+            COUNT(DISTINCT usuario) AS usuarios_cohort
+        FROM cohort_base
+        GROUP BY data_ftd
+    ),
+    atividade AS (
+        SELECT
+            f.id_usuario,
+            f.data,
+            COALESCE(f.ggr, 0) AS ggr,
+            f.usuario_ativo
+        FROM inplay.fact_user_atividade_diaria f
+        WHERE f.id_usuario IN (SELECT usuario FROM cohort_base)
+          AND f.data >= DATE '{inicio}'
+          AND f.data <  DATE '{fim}' + INTERVAL '90 days'
+    ),
+    retencao_janela AS (
+        SELECT
+            cb.data_ftd,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 'D1'
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 'D7'
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 'D30'
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 'D60'
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 'D90'
+            END AS janela_retencao,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 1
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 7
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 30
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 60
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 90
+            END AS dias_janela,
+            COUNT(DISTINCT CASE WHEN a.usuario_ativo THEN a.id_usuario END) AS usuarios_retidos,
+            SUM(a.ggr) AS ltv_dia
+        FROM cohort_base cb
+        JOIN atividade a
+          ON cb.usuario = a.id_usuario
+         AND a.data >= cb.data_ftd
+         AND (a.data - cb.data_ftd) BETWEEN 1 AND 90
+        GROUP BY
+            cb.data_ftd,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 'D1'
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 'D7'
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 'D30'
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 'D60'
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 'D90'
+            END,
+            CASE
+                WHEN (a.data - cb.data_ftd) = 1 THEN 1
+                WHEN (a.data - cb.data_ftd) BETWEEN 2 AND 7  THEN 7
+                WHEN (a.data - cb.data_ftd) BETWEEN 8 AND 30 THEN 30
+                WHEN (a.data - cb.data_ftd) BETWEEN 31 AND 60 THEN 60
+                WHEN (a.data - cb.data_ftd) BETWEEN 61 AND 90 THEN 90
+            END
+    )
+    SELECT
+        r.data_ftd,
+        r.janela_retencao,
+        r.dias_janela,
+        ct.usuarios_cohort,
+        r.usuarios_retidos,
+        r.ltv_dia,
+        CURRENT_DATE AS updated_at
+    FROM retencao_janela r
+    JOIN cohort_tamanho ct
+      ON ct.data_ftd = r.data_ftd
+    WHERE r.janela_retencao IS NOT NULL
+"""
+
 
 def gerar_lotes_mensais(data_min, data_max):
     """Gera lista de (inicio, fim) em formato 'YYYY-MM-DD', um por mês,
@@ -186,7 +294,7 @@ def mes_ja_carregado(inicio, fim, logger):
 def main():
     parser = argparse.ArgumentParser(description="Backfill agg_cohort_atividade_diaria (ZEROUM)")
     parser.add_argument("--resume", action="store_true",
-                         help="Pula o TRUNCATE e pula meses que já têm dado carregado")
+                         help="Pula meses que já têm dado carregado (só ganho de tempo)")
     args = parser.parse_args()
 
     handler = RotatingFileHandler(
@@ -205,22 +313,16 @@ def main():
     try:
         logger.info(f"[BACKFILL] Iniciando (resume={args.resume})")
 
-        if not args.resume:
-            confirm = input(
-                "Isso vai APAGAR e RECARREGAR todo o histórico de "
-                "inplay.agg_cohort_atividade_diaria (cliente ZEROUM), em lotes "
-                "mensais. Confirma? (digite SIM): "
-            )
-            if confirm.strip().upper() != "SIM":
-                logger.info("[BACKFILL] Cancelado pelo usuário")
-                print("Cancelado.")
-                return
-
-            logger.info("[BACKFILL] Truncando agg_cohort_atividade_diaria")
-            ConnectionDB.conecta(DB, CLIENTE)
-            ConnectionDB.executa_dml(SQL_TRUNCATE, logger)
-        else:
-            print("Modo --resume: mantendo dados já carregados, pulando meses existentes.")
+        confirm = input(
+            "Isso vai recarregar (DELETE + INSERT, mês a mês) o histórico de "
+            "inplay.agg_cohort_atividade_diaria (cliente ZEROUM). Seguro rodar "
+            "com a carga incremental de produção ativa ao mesmo tempo. "
+            "Confirma? (digite SIM): "
+        )
+        if confirm.strip().upper() != "SIM":
+            logger.info("[BACKFILL] Cancelado pelo usuário")
+            print("Cancelado.")
+            return
 
         logger.info("[BACKFILL] Descobrindo intervalo de datas (min/max FTD)")
         ConnectionDB.conecta(DB, CLIENTE)
@@ -251,9 +353,29 @@ def main():
             logger.info(f"[BACKFILL] ({i}/{total_lotes}) Processando cohort {inicio} a {fim}")
             print(f"  [{i}/{total_lotes}] {inicio} -- processando...")
 
+            # DELETE + INSERT do próprio mês -- não mexe em nenhum outro
+            # data_ftd, então não conflita com o que a carga incremental
+            # possa estar escrevendo em paralelo em outros meses
+            ConnectionDB.conecta(DB, CLIENTE)
+            ConnectionDB.executa_dml(
+                SQL_DELETE_MES.format(inicio=inicio, fim=fim),
+                logger
+            )
             ConnectionDB.conecta(DB, CLIENTE)
             ConnectionDB.executa_dml(
                 SQL_BACKFILL_COHORT_ATIVIDADE_MES.format(inicio=inicio, fim=fim),
+                logger
+            )
+
+            # mesma coisa para a tabela de retenção por janela (D1/D7/D30/D60/D90)
+            ConnectionDB.conecta(DB, CLIENTE)
+            ConnectionDB.executa_dml(
+                SQL_DELETE_MES_JANELA.format(inicio=inicio, fim=fim),
+                logger
+            )
+            ConnectionDB.conecta(DB, CLIENTE)
+            ConnectionDB.executa_dml(
+                SQL_BACKFILL_COHORT_RETENCAO_JANELA_MES.format(inicio=inicio, fim=fim),
                 logger
             )
 
@@ -262,14 +384,15 @@ def main():
 
         logger.info("[BACKFILL] Concluído com sucesso -- todos os lotes processados")
         print("\nBackfill concluído com sucesso. Próximo passo: rodar "
-              "views_atualizadas_cohort_retencao_kpi.sql e ligar as chamadas "
-              "em consume_api.py (principal_zeroum).")
+              "views_atualizadas_cohort_retencao_kpi.sql (se ainda não rodou) "
+              "e conferir os números do BI.")
 
     except Exception as e:
         logger.error(f"[BACKFILL] Erro no backfill: {e}")
         print(f"\nErro no backfill: {e}")
-        print("Rode novamente com --resume para continuar de onde parou "
-              "(depois de corrigir a causa do erro).")
+        print("Rode novamente (com ou sem --resume) para continuar -- é "
+              "seguro repetir meses já processados, cada um se sobrescreve "
+              "sozinho.")
         raise
 
 
