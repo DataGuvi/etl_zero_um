@@ -48,7 +48,7 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | `API_AUTH` | Endpoint de autenticação Metabase |
 | `API_USER_ZEROUM`, `API_PASS_ZEROUM` | Credenciais API — ZeroUm |
 | `API_USER_ENERGIABET`, `API_PASS_ENERGIABET` | Credenciais API — Energiabet |
-| `API_ROTA_CSV` | Endpoint de extração CSV do Metabase |
+| `API_ROTA_CSV` | Endpoint de extração CSV do Metabase (usado tanto para cards salvos quanto para queries nativas) |
 | `EMAIL_SENDER` | Remetente dos alertas de erro |
 | `SENDER_PASSWORD` | Senha/app password do remetente |
 | `EMAIL_RECEIVER` | Destinatário dos alertas |
@@ -82,7 +82,11 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 
 ### Descrição dos módulos novos
 
-**`db_logger.py`** — persiste cada execução do ETL na tabela `inplay.etl_execution_logs` (banco determinado pelo cliente: ZEROUM/ZRO_1_BET → `dlzeroum`; ENERGIABET → `dlenergiabet`). Registra operação, status (`SUCCESS`/`FAILED`), horário de início/fim, duração e motivo do erro. Nunca lança exceção — uma falha no logger não interrompe o ETL.
+**`db_logger.py`** — persiste cada execução do ETL na tabela `inplay.etl_execution_logs` (banco determinado pelo cliente: ZEROUM/ZRO_1_BET → `dlzeroum`; ENERGIABET → `dlenergiabet`, via lista explícita `CLIENTES_ZEROUM`). Registra operação, status (`SUCCESS`/`FAILED`), horário de início/fim, duração e motivo do erro. Nunca lança exceção — uma falha no logger não interrompe o ETL.
+
+> ✅ **Corrigido:** `_resolver_banco` decide pelo cliente estar ou não em `CLIENTES_ZEROUM` (um `set` explícito), não por correspondência exata a `'ZEROUM'`. Ao adicionar `ZEROUM_VALIDA_APOSTA`/`ZEROUM_SALDO`/`ZEROUM_VALIDACAO`, os dois modos de backfill (`ZEROUM_BACKFILL_USUARIO`, `ZEROUM_BACKFILL_USUARIO_POR_IDS`) tinham ficado de fora da lista — a checagem inicial de "tabela garantida" ia para `dlenergiabet` por engano (chamadas explícitas de `log_operation(cliente='ZEROUM', ...)` já usavam o banco certo, então o log em si não corrompia, só a mensagem inicial). Os dois foram adicionados a `CLIENTES_ZEROUM`. Os modos `ENERGIABET_*` não precisam de entrada própria: caem no `else` (`dlenergiabet`) corretamente por padrão.
+
+**`consume_api.py`** — ⚠️ até esta revisão, `extrai_csv_nativo` chamava `time.sleep(...)` no laço de retry sem que o módulo `time` estivesse importado no arquivo. Isso não quebrava o caminho feliz, mas fazia qualquer retry real (tentativa 1 ou 2 de 3 falhando) estourar `NameError` em vez de tentar de novo — mascarando o erro original e anulando o propósito do retry. Corrigido com `import time` no topo do arquivo.
 
 **`agregacao_dim_usuario.py`** — alimenta as tabelas físicas que substituem o processamento pesado das views `vw_dim_usuario` e `vw_fato_usuarios_diario` no Redshift. Executado ao final de cada carga ZEROUM, escopado apenas aos usuários impactados na janela incremental. Não se aplica à Energiabet.
 
@@ -96,7 +100,7 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | Data Warehouse destino | Redshift (`dlzeroum`) | ZEROUM, ZRO_1_BET |
 | Data Warehouse destino | Redshift (`dlenergiabet`) | ENERGIABET |
 | Origem ZRO_1_BET | PostgreSQL externo (`zro1_bet_adtk`) | ZRO_1_BET |
-| Origem ZEROUM/ENERGIABET | API Metabase (Clickhouse) | ZEROUM, ENERGIABET |
+| Origem ZEROUM/ENERGIABET | API Metabase (Clickhouse) — cards salvos e queries nativas | ZEROUM, ENERGIABET |
 
 ### Tabelas no DW (schema `inplay`)
 
@@ -160,6 +164,32 @@ python main.py --cliente sobe_dados
 
 > Para carga histórica do ZRO_1_BET, alterar o parâmetro `modo` para `"historico"` na chamada de `principal_zro_1_bet()` em `consume_api.py`.
 
+### Validação de queries nativas (card vs. nativo)
+
+Antes de trocar a fonte de uma extração de "card do Metabase" para "query nativa" em produção (ver seção **Extrações nativas** abaixo), usar `valida_aposta` para comparar os dois resultados na mesma janela de tempo:
+
+```bash
+python main.py --cliente ZEROUM_VALIDA_APOSTA
+```
+
+Compara primeira e última aposta (card vs. nativo) e reporta linhas só numa fonte, duplicados e divergências — inclusive separando divergências explicáveis por diferença de horário entre as duas chamadas (`divergentes_timing_skew`) das genuinamente suspeitas (`divergentes_suspeitos`). Gera CSVs de diagnóstico quando há divergência.
+
+### Regularização pontual de `dim_usuario`
+
+Quando o pipeline principal falha no meio da execução (antes de chegar na etapa de usuários), `dim_usuario` pode ficar com `updated_at`/`import_date` desatualizados em relação às demais tabelas — porque a janela da incremental normal é calculada a partir de `fact_user_daily`, não de `dim_usuario`, e portanto não revisita sozinha o período em que a falha ocorreu. Duas rotinas cobrem esse cenário sem reprocessar o pipeline inteiro:
+
+```bash
+# Por janela de data (cobre todos os usuários atualizados a partir de uma data)
+python main.py --cliente ZEROUM_BACKFILL_USUARIO --data-inicial-backfill 2026-07-19T00:00:00
+python main.py --cliente ENERGIABET_BACKFILL_USUARIO --data-inicial-backfill 2026-07-19T00:00:00
+
+# Por lista específica de ids (ex.: ids identificados com carga incompleta)
+python main.py --cliente ZEROUM_BACKFILL_USUARIO_POR_IDS --ids-backfill 123,456,789
+python main.py --cliente ENERGIABET_BACKFILL_USUARIO_POR_IDS --ids-backfill 123,456,789
+```
+
+Ambas mexem só em `stg_usuario`/`dim_usuario` (não rodam agregações). Usar a de data como primeiro recurso ao descobrir o problema; a de ids quando já se tem uma lista exata de registros incompletos (ex.: via `SELECT id FROM dim_usuario WHERE updated_at IS NULL`), evitando reprocessar uma janela de dias inteira por poucos registros.
+
 Logs de execução gravados em `etl.log` (rotação automática: 5 arquivos × 10 MB). Em caso de falha, e-mail enviado automaticamente e resultado gravado em `inplay.etl_execution_logs`.
 
 
@@ -167,7 +197,9 @@ Logs de execução gravados em `etl.log` (rotação automática: 5 arquivos × 1
 
 ### E-mail (`send_email.py`)
 
-Implementa o padrão DataGuvi. Lê credenciais diretamente do `.env` (`EMAIL_SENDER`, `SENDER_PASSWORD`, `EMAIL_RECEIVER`). Disparado em qualquer exceção nos métodos principais (`principal_zeroum`, `principal_energiabet`, `principal_zro_1_bet`, `valida_dados`) e nos métodos de comunicação com a API (`conection`, `extrai_csv`, `extrai_dados_card`).
+Implementa o padrão DataGuvi. Lê credenciais diretamente do `.env` (`EMAIL_SENDER`, `SENDER_PASSWORD`, `EMAIL_RECEIVER`). Disparado em qualquer exceção nos métodos de orquestração de nível mais alto (`principal_zeroum`, `principal_energiabet`, `principal_zro_1_bet`, `valida_dados`, `valida_aposta`, `backfill_dim_usuario`, `backfill_dim_usuario_por_ids`, `processa_saldo_diario`).
+
+> As camadas internas de comunicação com a API (`conection`, `extrai_csv`, `extrai_dados_card`, `extrai_csv_nativo`) **não enviam e-mail** — só logam e deixam a exceção subir. Isso é proposital: até essa correção, uma mesma falha de rede/timeout podia gerar até 3 e-mails (um por camada da pilha de chamadas). Agora só o método de nível mais alto notifica, uma vez por falha.
 
 ### Log no banco (`db_logger.py`)
 
@@ -180,6 +212,12 @@ Implementa o padrão DataGuvi. Grava na tabela `inplay.etl_execution_logs` do ba
 | `ETL_ZRO_1_BET` | `dlzeroum` |
 | `VALIDACAO_ZEROUM` | `dlzeroum` |
 | `VALIDACAO_ENERGIABET` | `dlenergiabet` |
+| `VALIDA_APOSTA_ZEROUM` | `dlzeroum` |
+| `VALIDA_APOSTA_ENERGIABET` | `dlenergiabet` |
+| `BACKFILL_DIM_USUARIO_ZEROUM` | `dlzeroum` |
+| `BACKFILL_DIM_USUARIO_ENERGIABET` | `dlenergiabet` |
+| `BACKFILL_DIM_USUARIO_POR_IDS_ZEROUM` | `dlzeroum` |
+| `BACKFILL_DIM_USUARIO_POR_IDS_ENERGIABET` | `dlenergiabet` |
 
 Consultas úteis de monitoramento estão documentadas em `migration_etl_execution_logs.sql`.
 
@@ -195,7 +233,7 @@ Determina janela incremental (último updated_at em fact_user_daily)
         ↓
 Limpa stages
         ↓
-Extração paralela de cards Metabase
+Extração de cards Metabase + queries nativas
 (stage, depósito, saque, bônus, apostas, jogos, usuários)
         ↓
 Tratamento (NaN→None, descriptografia AES)
@@ -208,6 +246,22 @@ Para cada subconjunto: insere_dados_bulk (stage) → mergeia_dados (fact/dim)
         ↓
 Grava SUCCESS em etl_execution_logs
 ```
+
+### Extrações nativas (otimização de performance)
+
+Alguns cards do Metabase têm um problema estrutural: eles agregam (`GROUP BY`) o **histórico completo** de uma tabela grande (`Bet`, 9M+ linhas) e só aplicam o filtro de janela incremental **depois**, por fora — obrigando o ClickHouse a escanear/agregar tudo antes de descartar o que não interessa. Em produção isso já causou `MEMORY_LIMIT_EXCEEDED` e timeouts de dezenas de minutos.
+
+Três extrações foram reescritas como queries SQL nativas (rodando direto no ClickHouse via `extrai_csv_nativo`, em vez de um card salvo), com o filtro embutido **antes** da agregação:
+
+| Card original | Método novo | Observação de semântica |
+|---|---|---|
+| `ZeroUm_PrimeiraAposta` / `ZeroUm_UltimaAposta` | `extrai_aposta_nativo` (`_sql_aposta`) | Filtra **quem** entra na agregação (subquery de `ClientId`), mas agrega o histórico completo desse subconjunto — filtrar direto a agregação mudaria o resultado (confirmado via `valida_aposta`) |
+| `ZeroUm_UsuariosTotalizadorBet` | `extrai_usuario_totalizador_bet_nativo` (`_sql_usuario_totalizador_bet`) | Mesmo princípio: filtra `cliente_ajustado` (pequeno) antes do `JOIN` com `Bet` (grande) |
+| `ZeroUm_ApostasJogosHora` | `extrai_apostas_jogos_hora_nativo` (`_sql_apostas_jogos_hora`) | Sem risco de mudança de semântica — o agrupamento já deriva do mesmo campo usado no filtro, então filtrar antes ou depois do `GROUP BY` dá o mesmo resultado |
+
+> **EnergiaBet:** a correção de `ApostasJogosHora` e de primeira/última aposta depende de `PartnerId`, ainda não confirmado para a EnergiaBet — essas duas continuam no card antigo para esse cliente (sinalizado em comentário no código). `UsuariosTotalizadorBet` não depende de `PartnerId` e já foi aplicado para os dois clientes.
+
+Cada método nativo tem timeout próprio, maior que o de cards normais (900s, versus 2400s de `extrai_dados_card`) — não porque a query nativa seja mais lenta no geral, mas porque quando aplicável a query nativa está fazendo um trabalho estrutural diferente (agregação de histórico completo de um subconjunto), medido manualmente antes de calibrar a margem.
 
 ### ZRO_1_BET
 
@@ -230,4 +284,4 @@ Grava SUCCESS em etl_execution_logs
 
 Ao adicionar um novo cliente, seguir o padrão ZRO_1_BET: métodos separados por etapa, try/except com `self.db_logger.log_operation()` + `send_email()` no except, re-raise ao final. O `get_log_history()` já está disponível na classe para compor o body do e-mail.
 
-
+> Seguindo a correção de e-mails duplicados: se o novo método chamar outros métodos internos da classe (`extrai_csv`, `extrai_csv_nativo`, `extrai_dados_card`, etc.), esses métodos internos não devem enviar e-mail — só o método de orquestração de nível mais alto deve notificar, uma vez por falha.

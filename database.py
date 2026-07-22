@@ -64,7 +64,12 @@ class ConnectionDB:
                     dbname=DB_NAME,
                     user=usuario,
                     password=DB_PASS,
-                    port=DB_PORT
+                    port=DB_PORT,
+                    connect_timeout=30,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=3,
                 )
             conn.autocommit = False
             cur = conn.cursor()
@@ -123,6 +128,16 @@ class ConnectionDB:
         try:
             print("realiza o merge dos dados")
 
+            # inclusão para visualiar os erros que eventualmente temos por dados duplicados
+            duplicados = df[df.duplicated(subset=campos_chave, keep=False)]
+            if not duplicados.empty:
+                logger.warning(
+                    f"[MERGE {tabela_destino}] {len(duplicados)} linhas duplicadas "
+                    f"na chave {campos_chave} (origem: {tabela_origem})"
+                )
+                print(f"[MERGE {tabela_destino}] Linhas duplicadas detectadas na chave {campos_chave}:")
+                print(duplicados.sort_values(campos_chave).to_string())
+
             chave = ''
 
             for campo in campos_chave:
@@ -153,8 +168,14 @@ class ConnectionDB:
         except Exception as e:
             if conn:
                 conn.rollback()
-            logger.error(f"Erro ao mergear os dados na tabela {tabela_destino}")
-            print(f"Erro ao mergear os dados: {e}")
+            logger.error(f"Erro ao mergear os dados na tabela {tabela_destino}: {e}")
+            if not duplicados.empty:
+                logger.error(
+                    f"[MERGE {tabela_destino}] Provável causa: {len(duplicados)} "
+                    f"chaves duplicadas em {campos_chave}. Amostra: "
+                    f"{duplicados[campos_chave].drop_duplicates().head(5).to_dict('records')}"
+                )
+                print(f"Erro ao mergear os dados: {e}")
             raise
         finally:
             if cur:

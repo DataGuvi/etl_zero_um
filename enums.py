@@ -132,3 +132,12 @@ class MetabaseCard(Enum):
     EnergiaBet_Validacao_ApostasDia = "card__17513"
     EnergiaBet_Validacao_DepositoSaque = "card__17514"
     EnergiaBet_Validacao_RegistroUsuario = "card__17515"
+
+    #Codigo das consultas de Saldo/Sessão (Account, ClientDailyBalance, ClientSession)
+    ZeroUm_SaldoRealtime = "card__20397"
+    ZeroUm_SaldoDiario = "card__20433"
+    ZeroUm_SessoesDiarias = "card__20434"
+ 
+    EnergiaBet_SaldoRealtime = "card__20396"
+    EnergiaBet_SaldoDiario = "card__20432"
+    EnergiaBet_SessoesDiarias = "card__20527"

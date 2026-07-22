@@ -37,7 +37,7 @@ PROJECT_NAME = 'etl_inplay'
 TABLE_NAME   = 'inplay.etl_execution_logs'
 
 # Clientes que gravam no banco ZEROUM (dlzeroum)
-CLIENTES_ZEROUM = {'ZEROUM', 'ZRO_1_BET', 'ZEROUM_VALIDACAO'}
+CLIENTES_ZEROUM = {'ZEROUM', 'ZRO_1_BET', 'ZEROUM_VALIDACAO', 'ZEROUM_SALDO', 'ZEROUM_VALIDA_APOSTA', 'ZEROUM_BACKFILL_USUARIO','ZEROUM_BACKFILL_USUARIO_POR_IDS' }
 
 DDL_CREATE_TABLE = f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -135,7 +135,12 @@ class DBLogger:
             dbname=self.db_name,
             user=quote_plus(DB_USER),
             password=DB_PASS,
-            port=DB_PORT
+            port=DB_PORT,
+            connect_timeout=30,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
 
     # ------------------------------------------------------------------
