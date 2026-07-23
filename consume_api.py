@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import numpy as np
 import io
+import time
 from datetime import datetime, timedelta, date
 from config import API_AUTH, API_USER_ZEROUM, API_PASS_ZEROUM, API_USER_ENERGIABET, API_PASS_ENERGIABET, API_ROTA_CSV, DB
 from enums import MetabaseTable, MetabaseDatabase, MetabaseCard
@@ -877,7 +878,7 @@ class ConsumeAPI:
 
         return create_engine(url)
 
-    def extrai_csv(self, auth_id:str, database:int, table:int=0, card:str='', filter:str=None, timeout:int=2400):
+    def extrai_csv(self, auth_id:str, database:int, table:int=0, card:str='', filter:str=None, timeout:int=2400, max_tentativas:int=3):
         try:
             self.rota = API_ROTA_CSV
             self.header = {
@@ -904,7 +905,35 @@ class ConsumeAPI:
             # de cassino por hora) sem interromper execuções normais; só estoura se
             # realmente travar. Chamadas com janela maior que o normal (ex.: backfill
             # de dim_usuario) podem passar um valor maior.
-            response = requests.post(self.rota, headers=self.header, json=self.body, timeout=timeout)
+            #
+            # retry com backoff (mesmo padrão de extrai_csv_nativo): o Metabase
+            # ocasionalmente derruba a conexão no meio da requisição
+            # (RemoteDisconnected/ConnectionError) sem nenhum problema real com a
+            # consulta — sem retry aqui, isso derrubava o ETL inteiro (ver falha
+            # do card ZeroUm_Stage). Só reage a falhas de conexão/timeout; um
+            # status HTTP != 200 continua sendo apenas logado, não re-tentado,
+            # pois normalmente indica erro na própria query, que não se resolve
+            # tentando de novo.
+            ultimo_erro = None
+            response = None
+            for tentativa in range(1, max_tentativas + 1):
+                try:
+                    response = requests.post(self.rota, headers=self.header, json=self.body, timeout=timeout)
+                    break
+                except requests.exceptions.RequestException as e:
+                    ultimo_erro = e
+                    self.logger.warning(
+                        f"[extrai_csv] card={card} tentativa {tentativa}/{max_tentativas} "
+                        f"falhou (timeout={timeout}s): {e}"
+                    )
+                    if tentativa < max_tentativas:
+                        time.sleep(5 * tentativa)
+
+            if response is None:
+                self.logger.error(
+                    f"[extrai_csv] card={card} falhou após {max_tentativas} tentativas: {ultimo_erro}"
+                )
+                raise ultimo_erro
 
             print("requisição realizada")
             #print(response)
@@ -964,6 +993,14 @@ class ConsumeAPI:
                 csv = self.extrai_csv(auth_id, id_database, 0, id_card, ["between",["field",campo_filtro,{"base-type":tipo_campo}], data_inicial, data_final], timeout=timeout)
             try:
                 df = pd.read_csv(io.BytesIO(csv))
+                #para verificar erro 
+                print("=" * 80)
+                print(f"CARD {id_card}")
+                print("Shape:", df.shape)
+                print("Colunas:")
+                print(df.columns.tolist())
+                print(df.head(3))
+                print("=" * 80)
             except pd.errors.EmptyDataError as e:
                     self.logger.error(
                         f"[extrai_dados_card] Card {id_card} retornou CSV vazio "
