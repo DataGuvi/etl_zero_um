@@ -113,6 +113,77 @@ class ConsumeAPI:
         except Exception as e:
             return f"(não foi possível ler o etl.log: {e})"
 
+    def _recupera_data_base_incremental(self, cliente: str, tabelas: list):
+        """
+        Calcula a data base para o incremental olhando o max(updated_at) de
+        TODAS as tabelas de destino do pipeline (não só a primeira), e
+        retorna a MAIS DESATUALIZADA (o mínimo entre os máximos).
+
+        Motivação (ponto pendente desta conversa): principal_zeroum/
+        principal_energiabet gravam em sequência várias tabelas de destino
+        (fact_user_daily, fact_user_daily_sport,
+        fact_deposits_withdraws_summarized, fact_casino_games_hourly,
+        dim_usuario). Se uma rodada anterior quebrar no meio do caminho
+        (ex.: erro na API do Metabase, timeout, MEMORY_LIMIT_EXCEEDED), as
+        tabelas gravadas ANTES da falha ficam com updated_at mais recente
+        que as gravadas DEPOIS — as datas de updated_at das tabelas
+        divergem entre si.
+
+        Usar só uma tabela (a primeira, fact_user_daily) como já era feito
+        antes fazia a rodada seguinte calcular data_inicial a partir do
+        ponto mais avançado, pulando exatamente a janela que faltou gravar
+        nas tabelas que não chegaram a rodar — um buraco silencioso nos
+        dados.
+
+        Usando o MÍNIMO entre os MAX(updated_at) de todas as tabelas,
+        data_inicial sempre parte do ponto da tabela mais atrasada:
+        reprocessa um pouco a mais nas tabelas que já estavam em dia (sem
+        problema, o merge é idempotente/upsert), mas nunca deixa buraco na
+        que ficou pra trás.
+        """
+        datas_por_tabela = {}
+        for tabela in tabelas:
+            ConnectionDB.conecta(DB, cliente)
+            resultado = ConnectionDB.recupera_dados(tabela, 'max(updated_at) as updated_at', '')
+            data_tabela = resultado[0][0] if resultado else None
+            if data_tabela is None:
+                self.logger.warning(
+                    f"[{cliente}] {tabela}: max(updated_at) veio nulo (tabela "
+                    "vazia?) — ignorada no cálculo da data base incremental."
+                )
+                continue
+            datas_por_tabela[tabela] = data_tabela
+
+        if not datas_por_tabela:
+            raise ValueError(
+                f"[{cliente}] Não foi possível recuperar updated_at de "
+                f"nenhuma das tabelas de destino {tabelas} para calcular a "
+                "data base incremental."
+            )
+
+        tabela_mais_desatualizada = min(datas_por_tabela, key=datas_por_tabela.get)
+        data_base = datas_por_tabela[tabela_mais_desatualizada]
+
+        if len(set(datas_por_tabela.values())) > 1:
+            detalhes = ", ".join(
+                f"{tabela}={data}" for tabela, data in
+                sorted(datas_por_tabela.items(), key=lambda item: item[1])
+            )
+            self.logger.warning(
+                f"[{cliente}] Datas de updated_at divergentes entre as "
+                f"tabelas de destino (provável rodada anterior interrompida "
+                f"no meio do caminho): {detalhes}. Usando a mais "
+                f"desatualizada ({tabela_mais_desatualizada} = {data_base}) "
+                "como data base para não deixar buraco no incremental."
+            )
+        else:
+            self.logger.info(
+                f"[{cliente}] Datas de updated_at em sincronia entre as "
+                f"tabelas de destino: {data_base}."
+            )
+
+        return data_base
+
     def principal_zeroum(self):
         try:
             start_time = datetime.now()
@@ -130,12 +201,14 @@ class ConsumeAPI:
             self.logger.info("Fazendo a autenticação no Metabase")
             auth_id = self.conection('ZEROUM')
             #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
-            ConnectionDB.conecta(DB, 'ZEROUM')
             self.logger.info("Recuperando a data base para consulta")
-            data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
-            print('data_importacao')
-            print(data_importacao)
-            data_base = data_importacao[0][0]
+            data_base = self._recupera_data_base_incremental('ZEROUM', [
+                'inplay.fact_user_daily',
+                'inplay.fact_user_daily_sport',
+                'inplay.fact_deposits_withdraws_summarized',
+                'inplay.fact_casino_games_hourly',
+                'inplay.dim_usuario',
+            ])
             #data_inicial = data_base - timedelta(days=5)
             print('data base')
             print(data_base)
@@ -447,12 +520,14 @@ class ConsumeAPI:
             self.logger.info("Fazendo a autenticação no Metabase")
             auth_id = self.conection('ENERGIABET')
             #auth_id = "2a30d8ef-dcfd-4753-bb87-b06dbefdd1d8"
-            ConnectionDB.conecta(DB, 'ENERGIABET')
             self.logger.info("Recuperando a data base para consulta")
-            data_importacao = ConnectionDB.recupera_dados('inplay.fact_user_daily', 'max(updated_at) as updated_at', '')
-            print('data_importacao')
-            print(data_importacao)
-            data_base = data_importacao[0][0]
+            data_base = self._recupera_data_base_incremental('ENERGIABET', [
+                'inplay.fact_user_daily',
+                'inplay.fact_user_daily_sport',
+                'inplay.fact_deposits_withdraws_summarized',
+                'inplay.fact_casino_games_hourly',
+                'inplay.dim_usuario',
+            ])
             #data_inicial = data_base - timedelta(days=5)
             print('data base')
             print(data_base)
@@ -2636,7 +2711,24 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
         texto = str(e).strip()
         if not texto:
             texto = repr(e)
-        return f"{type(e).__name__}: {texto}"
+        descricao = f"{type(e).__name__}: {texto}"
+
+        # CORREÇÃO DESTA REVISÃO: anexa o corpo da resposta HTTP (quando
+        # existir) à descrição que vai pro e-mail de alerta e pro log em
+        # inplay.etl_execution_logs — antes o e-mail de "[FALHA
+        # ENGENHARIA]" só trazia "HTTPError: 500 Server Error:
+        # Internal Server Error for url: ...", sem a mensagem real do
+        # Metabase, obrigando a reproduzir o erro manualmente pra
+        # descobrir a causa.
+        response = getattr(e, "response", None)
+        if response is not None:
+            try:
+                corpo = response.text.strip()[:2000]
+                if corpo:
+                    descricao += f" | corpo da resposta: {corpo}"
+            except Exception:
+                pass
+        return descricao
  
     def _ultimo_dia_disponivel_na_origem(self, auth_id, id_database):
         """
@@ -2838,7 +2930,26 @@ WHERE _peerdb_is_deleted = 0
             df = pd.read_csv(io.BytesIO(csv))
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ReadTimeout,
-                requests.exceptions.ChunkedEncodingError) as e:
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.HTTPError) as e:
+            # HTTPError só entra nesta subdivisão quando é 5xx (erro do
+            # servidor Metabase/backend, potencialmente transitório ou
+            # ligado ao tamanho/custo da consulta — subdividir pode
+            # resolver, igual a um timeout). CORREÇÃO DESTA REVISÃO: até
+            # aqui, um 500 do Metabase não caía em nenhum destes ramos —
+            # `extrai_csv_nativo` já tentava 3x internamente e, ao
+            # esgotar as tentativas, o HTTPError subia direto por todos
+            # os níveis de recursão (período e ClientId) e derrubava o
+            # processo inteiro, mesmo quando reduzir a janela/faixa teria
+            # resolvido. Um 4xx (ex.: SQL malformado) não é tratado como
+            # transitório: subdividir não conserta uma query com erro de
+            # sintaxe, então deixamos subir imediatamente para não gastar
+            # minutos refazendo a mesma consulta quebrada em pedaços cada
+            # vez menores.
+            if isinstance(e, requests.exceptions.HTTPError):
+                status = e.response.status_code if e.response is not None else None
+                if status is None or status < 500:
+                    raise
             if piso_temporal:
                 return self._particiona_por_client_id(
                     auth_id, id_database, id_card, data_inicial_dt, data_final_dt,
@@ -2974,9 +3085,22 @@ WHERE _peerdb_is_deleted = 0
                 return response.content
             except requests.exceptions.RequestException as e:
                 ultimo_erro = e
+                # CORREÇÃO DESTA REVISÃO: str(e) num HTTPError só traz
+                # "500 Server Error: Internal Server Error for url: ...",
+                # sem a mensagem real que o Metabase manda no corpo da
+                # resposta (costuma vir com o motivo do erro de
+                # SQL/backend). Sem isso, o e-mail de alerta e o log não
+                # davam pista nenhuma do motivo real — só o status code.
+                corpo_resposta = None
+                if e.response is not None:
+                    try:
+                        corpo_resposta = e.response.text[:2000]
+                    except Exception:
+                        corpo_resposta = None
                 self.logger.warning(
                     f"[extrai_csv_nativo] Tentativa {tentativa}/{max_tentativas} "
                     f"falhou (timeout={timeout}s): {e}"
+                    + (f" | corpo da resposta: {corpo_resposta}" if corpo_resposta else "")
                 )
                 if tentativa < max_tentativas:
                     time.sleep(5 * tentativa)
