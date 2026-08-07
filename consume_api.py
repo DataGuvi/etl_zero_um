@@ -4,13 +4,12 @@ import numpy as np
 import io
 import time
 from datetime import datetime, timedelta, date
-from config import API_AUTH, API_USER_ZEROUM, API_PASS_ZEROUM, API_USER_ENERGIABET, API_PASS_ENERGIABET, API_ROTA_CSV, DB
+from config import API_AUTH, API_USER_ZEROUM, API_PASS_ZEROUM, API_USER_ENERGIABET, API_PASS_ENERGIABET, API_ROTA_CSV, DB, METABASE_CARD_USUARIOS_ZEROUM, METABASE_CARD_USUARIOS_ENERGIABET
 from enums import MetabaseTable, MetabaseDatabase, MetabaseCard
 from database import ConnectionDB
 import logging
 from logging.handlers import RotatingFileHandler
 from send_email import send_email
-from util import Util
 import os
 from sqlalchemy import create_engine
 from sqlalchemy import text
@@ -99,6 +98,30 @@ class ConsumeAPI:
                 )
             else:
                 self.backfill_dim_usuario_por_ids('ENERGIABET', ids_backfill)
+        elif cliente == 'ZEROUM_BACKFILL_HISTORICO_PROTECAO':
+            # Carga histórica ÚNICA da melhoria de proteção de dados pessoais
+            # (Frente A: lastname/taxnumber/documento/kyc: Frente B: colunas
+            # first_name_protegido/mobile_number_protegido/birth_date_protegido).
+            # Uso único, roda contra o card de teste em validação (via
+            # METABASE_CARD_USUARIOS_ZEROUM no .env) e depois contra produção.
+            # Reaproveita data_inicial_backfill/data_final como início/fim do
+            # intervalo histórico a cobrir (ex.: --data-inicial-backfill=2015-01-01T00:00:00
+            # --data-final=2026-08-01T00:00:00).
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ZEROUM_BACKFILL_HISTORICO_PROTECAO requer --data-inicial-backfill "
+                    "e --data-final (formato YYYY-MM-DDTHH:MM:SS, ex.: 2015-01-01T00:00:00)"
+                )
+            else:
+                self.backfill_historico_protecao_dados_pessoais('ZEROUM', data_inicial_backfill, data_final)
+        elif cliente == 'ENERGIABET_BACKFILL_HISTORICO_PROTECAO':
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ENERGIABET_BACKFILL_HISTORICO_PROTECAO requer --data-inicial-backfill "
+                    "e --data-final (formato YYYY-MM-DDTHH:MM:SS, ex.: 2015-01-01T00:00:00)"
+                )
+            else:
+                self.backfill_historico_protecao_dados_pessoais('ENERGIABET', data_inicial_backfill, data_final)
         else:
             self.logger.error("Cliente inválido")
 
@@ -392,34 +415,25 @@ class ConsumeAPI:
             ConnectionDB.conecta(DB, 'ZEROUM')
             ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
 
-            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Usuarios.value, data_inicial, 0)
-            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+            #df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, MetabaseCard.ZeroUm_Usuarios.value, data_inicial, 0)
+            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerZeroum.value, METABASE_CARD_USUARIOS_ZEROUM, data_inicial, 0)
+            # LEITURA B (decisão de produto): first_name/birth_date/mobile_number
+            # NÃO são mais selecionados nem gravados -- essas colunas ficam
+            # congeladas em dim_usuario a partir daqui, sem receber nenhuma
+            # atualização futura da incremental. Só as colunas "_protegido"
+            # (cifradas, já vêm prontas do card -- ver SELECT) continuam sendo
+            # alimentadas. Nenhum decrypt acontece mais neste método.
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','email_verified','email',
+                                        'mobile_number_verified','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario']]
-            
-            #print("🚨 INICIO DESCRIPTOGRAFIA")
-            #print("ANTES:")
-            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario',
+                                        # 8 campos novos (Frente A)
+                                        'LastName', 'TaxNumber', 'DocumentType', 'DocumentNumber',
+                                        'DocumentIssuedBy', 'IsDocumentVerified', 'KYCStatus', 'KYCDocsStatus',
+                                        # Frente B: já vêm cifrados do card, sem tratamento em Python
+                                        'first_name_protegido', 'mobile_number_protegido', 'birth_date_protegido']]
 
-            util = Util()
 
-            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
-
-            for col in colunas_criptografadas:
-                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
-                    lambda x: util.descriptografar("ZEROUM", x)
-                )
-            #print("DEPOIS:")
-            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
-
-            df_usuario_ajust['birth_date'] = pd.to_datetime(
-            df_usuario_ajust['birth_date'],
-                format='%d-%m-%Y',
-                errors='coerce'
-            )
-
-            # opcional (recomendado pra banco)
             #df_usuario_ajust['birth_date'] = df_usuario_ajust['birth_date'].dt.strftime('%Y-%m-%d')
 
 
@@ -708,33 +722,22 @@ class ConsumeAPI:
             ConnectionDB.conecta(DB, 'ENERGIABET')
             ConnectionDB.mergeia_dados('inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly', df_fact_cassino_game_hourly_ajust, ['reference', 'game_id'], self.logger)
 
-            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, MetabaseCard.EnergiaBet_Usuarios.value, data_inicial, 0)
-            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+            df_usuario = self.extrai_dados_card(auth_id, MetabaseDatabase.ClickhousePartnerEnergiabet.value, METABASE_CARD_USUARIOS_ENERGIABET, data_inicial, 0)
+            # LEITURA B (decisão de produto): first_name/birth_date/mobile_number
+            # NÃO são mais selecionados nem gravados -- essas colunas ficam
+            # congeladas em dim_usuario a partir daqui. Só as colunas
+            # "_protegido" (cifradas, já vêm prontas do card) continuam sendo
+            # alimentadas. Nenhum decrypt acontece mais neste método.
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','email_verified','email',
+                                        'mobile_number_verified','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm',  'status_usuario']]
-            
-            
-            #print("🚨 INICIO DESCRIPTOGRAFIA")
-            #print("ANTES:")
-            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
+                                        'last_withdraw_date','last_withdraw_amount', 'utm',  'status_usuario',
+                                        # 8 campos novos (Frente A)
+                                        'LastName', 'TaxNumber', 'DocumentType', 'DocumentNumber',
+                                        'DocumentIssuedBy', 'IsDocumentVerified', 'KYCStatus', 'KYCDocsStatus',
+                                        # Frente B: já vêm cifrados do card, sem tratamento em Python
+                                        'first_name_protegido', 'mobile_number_protegido', 'birth_date_protegido']]
 
-            util = Util()
-
-            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
-
-            for col in colunas_criptografadas:
-                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
-                    lambda x: util.descriptografar("ENERGIABET", x)
-                )
-            #print("DEPOIS:")
-            #print(df_usuario_ajust[['birth_date', 'first_name', 'mobile_number']].head(5))
-
-            df_usuario_ajust['birth_date'] = pd.to_datetime(
-            df_usuario_ajust['birth_date'],
-                format='%d-%m-%Y',
-                errors='coerce'
-            )
 
             # opcional (recomendado pra banco)
             #df_usuario_ajust['birth_date'] = df_usuario_ajust['birth_date'].dt.strftime('%Y-%m-%d')
@@ -2306,31 +2309,24 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
                         if cliente == 'ZEROUM'
                         else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
 
-            card_usuarios = (MetabaseCard.ZeroUm_Usuarios.value if cliente == 'ZEROUM'
-                              else MetabaseCard.EnergiaBet_Usuarios.value)
+            card_usuarios = (METABASE_CARD_USUARIOS_ZEROUM if cliente == 'ZEROUM'
+                              else METABASE_CARD_USUARIOS_ENERGIABET)
             card_totalizador = (MetabaseCard.ZeroUm_UsuariosTotalizador.value if cliente == 'ZEROUM'
                                  else MetabaseCard.EnergiaBet_UsuariosTotalizador.value)
 
             auth_id = self.conection(cliente)
 
             df_usuario = self.extrai_dados_card(auth_id, database, card_usuarios, data_inicial_str, 0)
-            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+            # LEITURA B (decisão de produto): first_name/birth_date/mobile_number
+            # NÃO são mais selecionados nem gravados. Só as colunas
+            # "_protegido" (cifradas, já vêm prontas do card) são carregadas.
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','email_verified','email',
+                                        'mobile_number_verified','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario']]
+                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario', 'LastName', 'TaxNumber', 'DocumentType', 'DocumentNumber',
+                                         'DocumentIssuedBy', 'IsDocumentVerified', 'KYCStatus', 'KYCDocsStatus',
+                                         'first_name_protegido', 'mobile_number_protegido', 'birth_date_protegido']]
 
-            util = Util()
-            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
-            for col in colunas_criptografadas:
-                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
-                    lambda x: util.descriptografar(cliente, x)
-                )
-
-            df_usuario_ajust['birth_date'] = pd.to_datetime(
-                df_usuario_ajust['birth_date'],
-                format='%d-%m-%Y',
-                errors='coerce'
-            )
 
             df_usuario_totalizador = self.extrai_dados_card(auth_id, database, card_totalizador, data_inicial_str, 0)
             df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
@@ -2410,31 +2406,24 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
                         if cliente == 'ZEROUM'
                         else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
 
-            card_usuarios = (MetabaseCard.ZeroUm_Usuarios.value if cliente == 'ZEROUM'
-                              else MetabaseCard.EnergiaBet_Usuarios.value)
+            card_usuarios = (METABASE_CARD_USUARIOS_ZEROUM if cliente == 'ZEROUM'
+                              else METABASE_CARD_USUARIOS_ENERGIABET)
             card_totalizador = (MetabaseCard.ZeroUm_UsuariosTotalizador.value if cliente == 'ZEROUM'
                                  else MetabaseCard.EnergiaBet_UsuariosTotalizador.value)
 
             auth_id = self.conection(cliente)
 
             df_usuario = self.extrai_dados_card_por_ids(auth_id, database, card_usuarios, ids)
-            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','birth_date','first_name','email_verified','email',
-                                        'mobile_number_verified','mobile_number','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
+            # LEITURA B (decisão de produto): first_name/birth_date/mobile_number
+            # NÃO são mais selecionados nem gravados. Só as colunas
+            # "_protegido" (cifradas, já vêm prontas do card) são carregadas.
+            df_usuario_ajust = df_usuario[['id','core_account_status','core_user_language','core_wallet_currency','email_verified','email',
+                                        'mobile_number_verified','refer_id','sms_allowed','email_allowed','city','state','updated_at','registration_date','import_date',
                                         'first_deposit_date','first_deposit_amount','first_withdraw_date','first_withdraw_amount','last_deposit_date','last_deposit_amount',
-                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario']]
+                                        'last_withdraw_date','last_withdraw_amount', 'utm', 'status_usuario', 'LastName', 'TaxNumber', 'DocumentType', 'DocumentNumber',
+                                         'DocumentIssuedBy', 'IsDocumentVerified', 'KYCStatus', 'KYCDocsStatus',
+                                         'first_name_protegido', 'mobile_number_protegido', 'birth_date_protegido']]
 
-            util = Util()
-            colunas_criptografadas = ['birth_date', 'first_name', 'mobile_number']
-            for col in colunas_criptografadas:
-                df_usuario_ajust[col] = df_usuario_ajust[col].apply(
-                    lambda x: util.descriptografar(cliente, x)
-                )
-
-            df_usuario_ajust['birth_date'] = pd.to_datetime(
-                df_usuario_ajust['birth_date'],
-                format='%d-%m-%Y',
-                errors='coerce'
-            )
 
             df_usuario_totalizador = self.extrai_dados_card_por_ids(auth_id, database, card_totalizador, ids)
             df_usuario_totalizador_ajust = df_usuario_totalizador[['id','total_quantity_deposit','total_amount_deposit','total_quantity_withdraw','total_amount_withdraw']]
@@ -2490,6 +2479,283 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
                 f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
             )
             send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na regularização pontual de dim_usuario", body=b)
+            raise
+
+    def _extrai_usuario_em_janelas(self, auth_id, id_database, id_card, cliente,
+                                    data_inicial_dt, data_final_dt, colunas_origem,
+                                    contador, janela_minima=timedelta(hours=1)):
+        """
+        Extrai o card de usuários (Frente A + Frente B) em janelas de tempo
+        por registration_date, gravando cada janela IMEDIATAMENTE em
+        inplay.stg_usuario_backfill (nunca acumula o histórico inteiro em
+        memória — importante numa base de 9M+ usuários).
+
+        Por que não reaproveitar extrai_dados_card_por_periodo: esse método
+        já existe na classe, mas é hoje específico do fluxo de Saldo Diário
+        (monta SQL nativo via _sql_saldo_diario contra ClientDailyBalance).
+        Este método replica a MESMA estratégia geral (subdivide a janela ao
+        meio sempre que bater no teto do Metabase ou falhar por
+        timeout/conexão — self.LIMITE_LINHAS_METABASE, já existente na
+        classe), mas usando extrai_dados_card contra o card de usuários
+        (card de teste ou produção, conforme id_card recebido).
+
+        Erros HTTP 4xx (SQL/card malformado) sobem direto, sem subdividir —
+        subdividir a janela não conserta uma consulta com erro de sintaxe,
+        mesma lógica já usada em extrai_dados_card_por_periodo.
+        """
+        ini_str = data_inicial_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        fim_str = data_final_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        duracao = data_final_dt - data_inicial_dt
+
+        try:
+            df = self.extrai_dados_card(
+                auth_id, id_database, id_card, ini_str, fim_str,
+                campo_filtro="registration_date", timeout=2400,
+            )
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is None or status < 500:
+                raise
+            if duracao <= janela_minima:
+                self.logger.error(f"[BACKFILL] Falha 5xx na janela mínima {ini_str}-{fim_str}: {self._descricao_erro(e)}")
+                raise
+            self.logger.warning(f"[BACKFILL] Falha 5xx na janela {ini_str}-{fim_str}, dividindo ao meio: {self._descricao_erro(e)}")
+            meio = data_inicial_dt + duracao / 2
+            self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, data_inicial_dt, meio, colunas_origem, contador, janela_minima)
+            self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, meio, data_final_dt, colunas_origem, contador, janela_minima)
+            return
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if duracao <= janela_minima:
+                self.logger.error(f"[BACKFILL] Falha de conexão na janela mínima {ini_str}-{fim_str}: {self._descricao_erro(e)}")
+                raise
+            self.logger.warning(f"[BACKFILL] Falha de conexão na janela {ini_str}-{fim_str}, dividindo ao meio: {self._descricao_erro(e)}")
+            meio = data_inicial_dt + duracao / 2
+            self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, data_inicial_dt, meio, colunas_origem, contador, janela_minima)
+            self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, meio, data_final_dt, colunas_origem, contador, janela_minima)
+            return
+
+        if len(df) >= self.LIMITE_LINHAS_METABASE:
+            if duracao <= janela_minima:
+                self.logger.warning(
+                    f"[BACKFILL] Janela mínima atingida ({ini_str}-{fim_str}) e ainda assim "
+                    f"{len(df)} linhas -- possível truncamento residual. Revisar manualmente."
+                )
+            else:
+                self.logger.warning(
+                    f"[BACKFILL] Janela {ini_str}-{fim_str} atingiu o teto do Metabase "
+                    f"({len(df)} linhas). Dividindo ao meio."
+                )
+                meio = data_inicial_dt + duracao / 2
+                self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, data_inicial_dt, meio, colunas_origem, contador, janela_minima)
+                self._extrai_usuario_em_janelas(auth_id, id_database, id_card, cliente, meio, data_final_dt, colunas_origem, contador, janela_minima)
+                return
+
+        if len(df) == 0:
+            self.logger.info(f"[BACKFILL] Janela {ini_str}-{fim_str}: 0 linhas, pulando.")
+            return
+
+        df_ajust = df[colunas_origem].rename(columns={
+            'first_name': 'first_name_protegido',
+            'birth_date': 'birth_date_protegido',
+            'mobile_number': 'mobile_number_protegido',
+        })
+        df_ajust = df_ajust.replace({np.nan: None})
+
+        # Retry com reconexão: numa execução de horas (9M+ usuários, muitas
+        # janelas), uma queda pontual de conexão com o Redshift (rede, VPN,
+        # timeout de sessão) é esperada em algum momento -- sem isso, uma
+        # única falha transitória em qualquer janela derruba a execução
+        # inteira e perde todo o progresso já feito (não há checkpoint; a
+        # stg só é truncada uma vez, no início, mas se o processo morrer
+        # tudo precisa ser refeito do zero).
+        max_tentativas = 3
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_usuario_backfill', df_ajust, self.logger)
+                break
+            except Exception as e:
+                if tentativa == max_tentativas:
+                    self.logger.error(
+                        f"[BACKFILL] Falha ao inserir janela {ini_str}-{fim_str} após "
+                        f"{max_tentativas} tentativas: {e}"
+                    )
+                    raise
+                espera = 5 * tentativa
+                self.logger.warning(
+                    f"[BACKFILL] Falha ao inserir janela {ini_str}-{fim_str} "
+                    f"(tentativa {tentativa}/{max_tentativas}): {e}. "
+                    f"Reconectando e tentando de novo em {espera}s."
+                )
+                time.sleep(espera)
+
+        contador['total'] += len(df_ajust)
+        contador['janelas'] += 1
+        self.logger.info(
+            f"[BACKFILL] Janela {ini_str}-{fim_str}: {len(df_ajust)} linhas inseridas "
+            f"(acumulado: {contador['total']} linhas em {contador['janelas']} janelas)"
+        )
+
+    def backfill_historico_protecao_dados_pessoais(self, cliente: str, data_inicio_str: str, data_fim_str: str):
+        """
+        Carga histórica ÚNICA da melhoria de proteção de dados pessoais em
+        dim_usuario (ver plano) -- une numa só passada:
+
+          Frente A (campos novos, sem par em claro): lastname, taxnumber,
+          documenttype, documentnumber, documentissuedby, isdocumentverified,
+          kycstatus, kycdocsstatus.
+
+          Frente B (campos já existentes, NÃO TOCA no original): grava o
+          valor cifrado em first_name_protegido/mobile_number_protegido/
+          birth_date_protegido -- first_name/birth_date/mobile_number
+          continuam intocados, porque a API do cliente consome esses 3
+          campos hoje (ver plano, Corte de Produção é etapa separada).
+
+        Usa METABASE_CARD_USUARIOS_ZEROUM/ENERGIABET (config.py, lido do
+        .env) como card -- em validação, apontar essas variáveis para o
+        card de teste (card__21517/card__21518); em produção, deixar sem
+        definir no .env (cai no fallback = card de produção real).
+
+        Extrai em janelas de tempo (self._extrai_usuario_em_janelas) para
+        não estourar o teto de exportação do Metabase (9M+ usuários na base
+        - uma extração única seria truncada silenciosamente). Cada janela é
+        gravada direto em inplay.stg_usuario_backfill; ao final, um único
+        UPDATE aplica as 11 colunas de uma vez em dim_usuario.
+
+        Não aplica decrypt em nenhum momento.
+
+        data_inicio_str/data_fim_str: formato 'YYYY-MM-DDTHH:MM:SS' (mesmo
+        padrão de --data-inicial-backfill já usado por
+        ZEROUM_BACKFILL_USUARIO), ex.: '2015-01-01T00:00:00'.
+        """
+        start_time = datetime.now()
+        try:
+            self.logger.info(
+                f"[BACKFILL] Iniciando carga histórica unificada (proteção de dados "
+                f"pessoais) para {cliente}, {data_inicio_str} a {data_fim_str}"
+            )
+
+            database = (MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM'
+                        else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+            id_card = (METABASE_CARD_USUARIOS_ZEROUM if cliente == 'ZEROUM'
+                       else METABASE_CARD_USUARIOS_ENERGIABET)
+
+            self.logger.info(f"[BACKFILL] Card em uso: {id_card}")
+
+            auth_id = self.conection(cliente)
+
+            colunas_origem = ['id',
+                               'LastName', 'TaxNumber', 'DocumentType', 'DocumentNumber',
+                               'DocumentIssuedBy', 'IsDocumentVerified', 'KYCStatus', 'KYCDocsStatus',
+                               'first_name', 'birth_date', 'mobile_number']
+
+            # Trunca a stg SÓ no início da execução inteira -- cada janela
+            # depois disso é um INSERT (append), nunca um TRUNCATE por janela.
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados('inplay.stg_usuario_backfill', '', self.logger)
+
+            data_inicio_dt = datetime.strptime(data_inicio_str, '%Y-%m-%dT%H:%M:%S')
+            data_fim_dt = datetime.strptime(data_fim_str, '%Y-%m-%dT%H:%M:%S')
+
+            contador = {'total': 0, 'janelas': 0}
+            self._extrai_usuario_em_janelas(
+                auth_id, database, id_card, cliente,
+                data_inicio_dt, data_fim_dt, colunas_origem, contador
+            )
+
+            self.logger.info(
+                f"[BACKFILL] Extração concluída: {contador['total']} linhas em "
+                f"{contador['janelas']} janelas gravadas em stg_usuario_backfill"
+            )
+
+            # Diagnóstico: a subdivisão recursiva de janelas usa um filtro
+            # "between" (inclusivo nas duas pontas) -- um usuário cujo
+            # registration_date caia EXATAMENTE no instante de corte entre
+            # duas janelas pode ser extraído duas vezes (uma em cada janela),
+            # gerando id duplicado em stg_usuario_backfill. Os valores das
+            # duas linhas são idênticos (mesma origem), então não corrompe o
+            # resultado -- mas duplicar o id quebraria o UPDATE (Redshift não
+            # aceita mais de uma linha da tabela de origem casando com a
+            # mesma linha de destino num UPDATE...FROM). Log aqui só para
+            # visibilidade -- a proteção de verdade está no sql_update abaixo.
+            ConnectionDB.conecta(DB, cliente)
+            resultado_dedup = ConnectionDB.recupera_dados(
+                'inplay.stg_usuario_backfill',
+                'count(*) as total, count(distinct id) as distintos', ''
+            )
+            if resultado_dedup:
+                total_linhas, ids_distintos = resultado_dedup[0]
+                if total_linhas != ids_distintos:
+                    self.logger.warning(
+                        f"[BACKFILL] stg_usuario_backfill tem {total_linhas} linhas mas só "
+                        f"{ids_distintos} ids distintos -- {total_linhas - ids_distintos} "
+                        "duplicatas detectadas (esperado, ver comentário no código). "
+                        "O UPDATE abaixo já deduplica por id antes de aplicar."
+                    )
+
+            # UPDATE protegido contra duplicidade: junta com uma versão
+            # deduplicada da stg (ROW_NUMBER() OVER PARTITION BY id = 1) em
+            # vez de ir direto contra a tabela -- garante no máximo uma linha
+            # de origem por id, mesmo que a extração em janelas tenha gravado
+            # o mesmo usuário mais de uma vez.
+            sql_update = """
+                UPDATE inplay.dim_usuario d
+                SET
+                    lastname                = s."LastName",
+                    taxnumber                = s."TaxNumber",
+                    documenttype             = s."DocumentType",
+                    documentnumber           = s."DocumentNumber",
+                    documentissuedby         = s."DocumentIssuedBy",
+                    isdocumentverified       = s."IsDocumentVerified",
+                    kycstatus                = s."KYCStatus",
+                    kycdocsstatus            = s."KYCDocsStatus",
+                    first_name_protegido     = s.first_name_protegido,
+                    mobile_number_protegido  = s.mobile_number_protegido,
+                    birth_date_protegido     = s.birth_date_protegido
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY id ORDER BY id) AS rn_dedup
+                    FROM inplay.stg_usuario_backfill
+                ) s
+                WHERE d.id = s.id
+                  AND s.rn_dedup = 1
+            """
+            self.logger.info("[BACKFILL] Aplicando UPDATE único em dim_usuario (11 colunas, deduplicado por id)...")
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.executa_dml(sql_update, self.logger)
+            self.logger.info(
+                "[BACKFILL] UPDATE concluído. LEMBRETE: rodar VACUUM e ANALYZE em "
+                "inplay.dim_usuario em seguida (fora de transação, janela de baixo "
+                "tráfego)."
+            )
+
+            self.db_logger.log_operation(
+                operation=f'BACKFILL_HISTORICO_PROTECAO_{cliente}',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro no backfill histórico de proteção de dados pessoais ({cliente}): {e}")
+            self.db_logger.log_operation(
+                operation=f'BACKFILL_HISTORICO_PROTECAO_{cliente}',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = (
+                f"Erro no backfill histórico de proteção de dados pessoais ({cliente}) "
+                f"de {data_inicio_str} a {data_fim_str}: {e}\n\n"
+                f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            )
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro no backfill histórico de proteção de dados pessoais", body=b)
             raise
 
     def processa_saldo_diario(self, cliente, modo="incremental", data_final=None):

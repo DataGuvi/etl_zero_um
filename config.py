@@ -34,3 +34,14 @@ DB_HOST_ZRO_1_BET_ADTK = os.getenv("DB_HOST_ZRO_1_BET_ADTK")
 DB_PORT_ZRO_1_BET_ADTK = os.getenv("DB_PORT_ZRO_1_BET_ADTK")
 DB_USER_ZRO_1_BET_ADTK = os.getenv("DB_USER_ZRO_1_BET_ADTK")
 DB_PASS_ZRO_1_BET_ADTK = os.getenv("DB_PASS_ZRO_1_BET_ADTK")
+
+# Cards de usuário usados pela melhoria de proteção de dados pessoais em
+# dim_usuario (Frente A/Frente B). Fallback = card de PRODUÇÃO real
+# (mesmo valor de MetabaseCard.ZeroUm_Usuarios/EnergiaBet_Usuarios em
+# enums.py) -- se a variável não existir no .env (como em produção), o
+# comportamento é idêntico ao de hoje. Em ambiente de validação, definir
+# no .env local:
+#   METABASE_CARD_USUARIOS_ZEROUM=card__21517
+#   METABASE_CARD_USUARIOS_ENERGIABET=card__21518
+METABASE_CARD_USUARIOS_ZEROUM = os.getenv("METABASE_CARD_USUARIOS_ZEROUM", "card__14826")
+METABASE_CARD_USUARIOS_ENERGIABET = os.getenv("METABASE_CARD_USUARIOS_ENERGIABET", "card__15850")

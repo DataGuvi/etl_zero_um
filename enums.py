@@ -141,3 +141,7 @@ class MetabaseCard(Enum):
     EnergiaBet_SaldoRealtime = "card__20396"
     EnergiaBet_SaldoDiario = "card__20432"
     EnergiaBet_SessoesDiarias = "card__20527"
+
+    # teste melhoria inclusão de novas colunas na dim_usuario
+    #METABASE_CARD_USUARIOS_ZEROUM="card__21517"
+    #METABASE_CARD_USUARIOS_ENERGIABET="card__21518"

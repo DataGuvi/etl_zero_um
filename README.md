@@ -59,6 +59,8 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | `DB_NAME_ZRO_1_BET_ADTK` | Database do PostgreSQL externo ZRO_1_BET |
 | `DB_USER_ZRO_1_BET_ADTK` | Usuário do PostgreSQL externo ZRO_1_BET |
 | `DB_PASS_ZRO_1_BET_ADTK` | Senha do PostgreSQL externo ZRO_1_BET |
+| `METABASE_CARD_USUARIOS_ZEROUM` | *(opcional)* Sobrescreve qual card o pipeline usa para dados de usuário — ZeroUm. Fallback (se ausente do `.env`): `card__14826`, o card de produção. Usar só em ambiente local/de teste, apontando para um card clonado (ex.: `card__21517`) — nunca definir em produção |
+| `METABASE_CARD_USUARIOS_ENERGIABET` | *(opcional)* Mesmo mecanismo acima, para Energiabet. Fallback: `card__15850` |
 
 
 ## Estrutura do Projeto
@@ -84,9 +86,11 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 
 **`db_logger.py`** — persiste cada execução do ETL na tabela `inplay.etl_execution_logs` (banco determinado pelo cliente: ZEROUM/ZRO_1_BET → `dlzeroum`; ENERGIABET → `dlenergiabet`, via lista explícita `CLIENTES_ZEROUM`). Registra operação, status (`SUCCESS`/`FAILED`), horário de início/fim, duração e motivo do erro. Nunca lança exceção — uma falha no logger não interrompe o ETL.
 
-> ✅ **Corrigido:** `_resolver_banco` decide pelo cliente estar ou não em `CLIENTES_ZEROUM` (um `set` explícito), não por correspondência exata a `'ZEROUM'`. Ao adicionar `ZEROUM_VALIDA_APOSTA`/`ZEROUM_SALDO`/`ZEROUM_VALIDACAO`, os dois modos de backfill (`ZEROUM_BACKFILL_USUARIO`, `ZEROUM_BACKFILL_USUARIO_POR_IDS`) tinham ficado de fora da lista — a checagem inicial de "tabela garantida" ia para `dlenergiabet` por engano (chamadas explícitas de `log_operation(cliente='ZEROUM', ...)` já usavam o banco certo, então o log em si não corrompia, só a mensagem inicial). Os dois foram adicionados a `CLIENTES_ZEROUM`. Os modos `ENERGIABET_*` não precisam de entrada própria: caem no `else` (`dlenergiabet`) corretamente por padrão.
+> ✅ **Corrigido:** `_resolver_banco` decide pelo cliente estar ou não em `CLIENTES_ZEROUM` (um `set` explícito), não por correspondência exata a `'ZEROUM'`. Ao adicionar `ZEROUM_VALIDA_APOSTA`/`ZEROUM_SALDO`/`ZEROUM_VALIDACAO`, os dois modos de backfill (`ZEROUM_BACKFILL_USUARIO`, `ZEROUM_BACKFILL_USUARIO_POR_IDS`) tinham ficado de fora da lista — a checagem inicial de "tabela garantida" ia para `dlenergiabet` por engano (chamadas explícitas de `log_operation(cliente='ZEROUM', ...)` já usavam o banco certo, então o log em si não corrompia, só a mensagem inicial). Os dois foram adicionados a `CLIENTES_ZEROUM`, junto com `ZEROUM_BACKFILL_HISTORICO_PROTECAO` (ver seção **Proteção de Dados Pessoais** abaixo). Os modos `ENERGIABET_*` não precisam de entrada própria: caem no `else` (`dlenergiabet`) corretamente por padrão.
 
 **`consume_api.py`** — ⚠️ até esta revisão, `extrai_csv_nativo` chamava `time.sleep(...)` no laço de retry sem que o módulo `time` estivesse importado no arquivo. Isso não quebrava o caminho feliz, mas fazia qualquer retry real (tentativa 1 ou 2 de 3 falhando) estourar `NameError` em vez de tentar de novo — mascarando o erro original e anulando o propósito do retry. Corrigido com `import time` no topo do arquivo.
+
+> 🔒 **Novo:** `principal_zeroum`/`principal_energiabet`/`backfill_dim_usuario`/`backfill_dim_usuario_por_ids` foram alterados para incluir os campos novos de identificação pessoal em `dim_usuario` e parar de descriptografar nome/data de nascimento/celular. Ver seção **Proteção de Dados Pessoais em `dim_usuario`** para detalhes completos (colunas novas, decisão de produto, e dois novos modos de `--cliente` para a carga histórica).
 
 **`agregacao_dim_usuario.py`** — alimenta as tabelas físicas que substituem o processamento pesado das views `vw_dim_usuario` e `vw_fato_usuarios_diario` no Redshift. Executado ao final de cada carga ZEROUM, escopado apenas aos usuários impactados na janela incremental. Não se aplica à Energiabet.
 
@@ -121,12 +125,18 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | `agg_usuario_reativacao` | Estado de reativação | ZEROUM |
 | `etl_execution_logs` | Log de execuções ETL | todos |
 
+> 🔒 **`dim_usuario` ganhou 11 colunas novas** relacionadas à proteção de dados pessoais
+> (`lastname`, `taxnumber`, `documenttype`, `documentnumber`, `documentissuedby`,
+> `isdocumentverified`, `kycstatus`, `kycdocsstatus`, `first_name_protegido`,
+> `mobile_number_protegido`, `birth_date_protegido`). Ver seção **Proteção de Dados
+> Pessoais em `dim_usuario`** para o detalhamento completo.
+
 **Stage (temporárias, limpas a cada carga):**
 `stg_fact_user_daily`, `stg_fact_user_daily_sport`, `stg_game`,
 `stg_fact_deposits_withdraws_summarized`, `stg_fact_casino_games_hourly`,
 `stg_usuario`, `stg_vendas_data`, `stg_usuarios_impactados`,
 `stg_fact_user_atividade_diaria`, `stg_agg_usuario_metricas`,
-`stg_agg_usuario_reativacao`
+`stg_agg_usuario_reativacao`, `stg_usuario_backfill`
 
 **Log/auditoria:**
 `log_vendas_data_rejeitados`, `stg_vendas_data_rejeitados_tmp`,
@@ -138,6 +148,7 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 |---|---|---|
 | `migration_tabelas_fisicas.sql` | `dlzeroum` | Cria tabelas de agregação (ZEROUM) |
 | `migration_etl_execution_logs.sql` | `dlzeroum` **e** `dlenergiabet` | Cria tabela de log de execuções |
+| `alter_dim_usuario_dados_pessoais.sql` | `dlzeroum` **e** `dlenergiabet` | Adiciona as 11 colunas de proteção de dados pessoais em `dim_usuario`/`stg_usuario`, e cria `stg_usuario_backfill` |
 
 > Os scripts de migração não fazem parte do deploy — são executados diretamente no banco antes da ativação.
 
@@ -190,6 +201,27 @@ python main.py --cliente ENERGIABET_BACKFILL_USUARIO_POR_IDS --ids-backfill 123,
 
 Ambas mexem só em `stg_usuario`/`dim_usuario` (não rodam agregações). Usar a de data como primeiro recurso ao descobrir o problema; a de ids quando já se tem uma lista exata de registros incompletos (ex.: via `SELECT id FROM dim_usuario WHERE updated_at IS NULL`), evitando reprocessar uma janela de dias inteira por poucos registros.
 
+### Carga histórica de proteção de dados pessoais (execução única)
+
+Ver seção **Proteção de Dados Pessoais em `dim_usuario`** para o contexto completo. Comando:
+
+```bash
+python main.py --cliente ZEROUM_BACKFILL_HISTORICO_PROTECAO \
+    --data-inicial-backfill 2015-01-01T00:00:00 --data-final 2026-08-01T00:00:00
+
+python main.py --cliente ENERGIABET_BACKFILL_HISTORICO_PROTECAO \
+    --data-inicial-backfill 2015-01-01T00:00:00 --data-final 2026-08-01T00:00:00
+```
+
+Extrai em janelas de tempo por `registration_date` (protege contra o teto de exportação
+de 1.048.575 linhas do Metabase), grava em `stg_usuario_backfill` e aplica um único
+`UPDATE` deduplicado por `id` ao final. Idempotente — pode ser reexecutado quantas vezes
+for necessário, inclusive para cobrir só o intervalo que ainda faltar (comparar
+`registration_date` de quem ainda está com as colunas novas em `NULL`).
+
+> Depois de uma carga grande (milhões de linhas), rodar `VACUUM`/`ANALYZE` em
+> `dim_usuario` manualmente — não é feito automaticamente pelo script.
+
 Logs de execução gravados em `etl.log` (rotação automática: 5 arquivos × 10 MB). Em caso de falha, e-mail enviado automaticamente e resultado gravado em `inplay.etl_execution_logs`.
 
 
@@ -218,8 +250,84 @@ Implementa o padrão DataGuvi. Grava na tabela `inplay.etl_execution_logs` do ba
 | `BACKFILL_DIM_USUARIO_ENERGIABET` | `dlenergiabet` |
 | `BACKFILL_DIM_USUARIO_POR_IDS_ZEROUM` | `dlzeroum` |
 | `BACKFILL_DIM_USUARIO_POR_IDS_ENERGIABET` | `dlenergiabet` |
+| `BACKFILL_HISTORICO_PROTECAO_ZEROUM` | `dlzeroum` |
+| `BACKFILL_HISTORICO_PROTECAO_ENERGIABET` | `dlenergiabet` |
 
 Consultas úteis de monitoramento estão documentadas em `migration_etl_execution_logs.sql`.
+
+
+## Proteção de Dados Pessoais em `dim_usuario`
+
+`dim_usuario` recebeu 11 colunas novas para armazenar dados de identificação pessoal do
+cliente. O objetivo é duplo: (1) trazer campos que nunca existiram na dimensão
+(sobrenome, CPF, documento, status KYC), e (2) parar de gravar em claro os campos que já
+existiam e continham dado sensível descriptografado (nome, data de nascimento, celular).
+
+### Colunas novas
+
+| Coluna | Tipo | Origem (Metabase/`Client`) | Fica cifrada? |
+|---|---|---|---|
+| `lastname` | `VARCHAR(256)` | `EncryptedLastName` | Sim |
+| `taxnumber` | `VARCHAR(100)` | `EncryptedTaxNumber` | Sim |
+| `documenttype` | `INTEGER` | `DocumentType` | Não (sem par cifrado na origem) |
+| `documentnumber` | `VARCHAR(50)` | `DocumentNumber` | Não |
+| `documentissuedby` | `VARCHAR(255)` | `DocumentIssuedBy` | Não |
+| `isdocumentverified` | `BOOLEAN` | `IsDocumentVerified` | — |
+| `kycstatus` | `INTEGER` | `KYCStatus` | — |
+| `kycdocsstatus` | `INTEGER` | `KYCDocsStatus` | — |
+| `first_name_protegido` | `VARCHAR(256)` | `EncryptedFirstName` | Sim |
+| `mobile_number_protegido` | `VARCHAR(256)` | `EncryptedPhoneNumber` | Sim |
+| `birth_date_protegido` | `VARCHAR(256)` | `DateOfBirth` | Sim |
+
+### Decisão de produto: `first_name`/`birth_date`/`mobile_number` ficam congelados
+
+As três colunas que já existiam (`first_name`, `birth_date`, `mobile_number`) **não são
+mais lidas nem gravadas** por nenhum dos métodos do pipeline — `principal_zeroum`,
+`principal_energiabet`, `backfill_dim_usuario` e `backfill_dim_usuario_por_ids` deixaram de
+selecioná-las e o bloco de descriptografia AES (`Util.descriptografar`) foi removido por
+completo desses métodos (o import de `Util` também foi removido de `consume_api.py` — a
+descriptografia deixou de acontecer em qualquer ponto deste pipeline). Essas três colunas
+ficam congeladas no último valor que já tinham antes desta mudança; só as colunas
+`*_protegido` continuam recebendo atualização, sempre cifradas.
+
+> Motivo: essas colunas são consumidas por uma API do cliente. A decisão foi não alterar o
+> formato do que a API já recebe — em vez de trocar o conteúdo (que quebraria o consumo
+> existente), o dado sensível passa a ser trazido só nas colunas novas, em paralelo.
+
+### Card do Metabase
+
+Os cards `card__14826` (ZeroUm) e `card__15850` (EnergiaBet) já foram atualizados em
+produção para expor as colunas novas — incluindo `first_name_protegido`,
+`mobile_number_protegido` e `birth_date_protegido` diretamente na `SELECT` (como aliases
+duplicados de `EncryptedFirstName`/`EncryptedPhoneNumber`/`DateOfBirth`, já que essas
+fontes também alimentam `first_name`/`mobile_number`/`birth_date`, que continuam sendo
+extraídas do card mas não são mais persistidas). Nenhuma descriptografia acontece: as
+colunas `*_protegido` são gravadas exatamente como retornam do Metabase.
+
+Para apontar um ambiente para um card de teste/clonado em vez do de produção, usar as
+variáveis `METABASE_CARD_USUARIOS_ZEROUM`/`METABASE_CARD_USUARIOS_ENERGIABET` no `.env`
+(ver seção **Variáveis de Ambiente**) — nunca editar `enums.py` para isso.
+
+### Carga histórica
+
+Ver comando em **Comandos de Execução** → *Carga histórica de proteção de dados
+pessoais*. Pontos importantes de implementação:
+
+- **Teto de exportação do Metabase (1.048.575 linhas):** `_extrai_usuario_em_janelas`
+  subdivide o intervalo pedido recursivamente por `registration_date` sempre que uma
+  janela bate no teto ou falha por timeout/conexão — mesmo espírito de
+  `extrai_dados_card_por_periodo` (ver seção **Extrações nativas**), mas específico para o
+  card de usuários (via `extrai_dados_card`, não uma query nativa).
+- **Sub-lotes de inserção:** cada janela extraída é inserida em `stg_usuario_backfill` em
+  sub-lotes de 100 mil linhas (não a janela inteira de uma vez), com retry de até 5
+  tentativas e backoff exponencial (10s a 90s) — mitiga quedas de conexão em execuções
+  longas (histórico completo pode levar horas).
+- **`UPDATE` final deduplicado:** o `UPDATE` de `stg_usuario_backfill` para `dim_usuario`
+  passa por uma subconsulta com `ROW_NUMBER() OVER (PARTITION BY id)` antes de aplicar —
+  protege contra duplicidade de `id` que pode ocorrer quando o filtro `BETWEEN` (inclusivo
+  nas duas pontas) captura o mesmo registro em duas janelas adjacentes.
+- Não é destrutivo: só popula colunas que não existiam ou que não têm mais nenhuma outra
+  escrita concorrente. Pode ser reexecutado livremente.
 
 
 ## Fluxo do ETL
@@ -236,7 +344,7 @@ Limpa stages
 Extração de cards Metabase + queries nativas
 (stage, depósito, saque, bônus, apostas, jogos, usuários)
         ↓
-Tratamento (NaN→None, descriptografia AES)
+Tratamento (NaN→None)
         ↓
 Para cada subconjunto: insere_dados_bulk (stage) → mergeia_dados (fact/dim)
         ↓

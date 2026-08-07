@@ -113,15 +113,25 @@ class ConnectionDB:
             execute_values(cur, sql, dados, page_size=10000)
             conn.commit()
         except Exception as e:
-            if conn:
-                conn.rollback()
+            # CORREÇÃO: se o servidor já derrubou a conexão (ex.: timeout de
+            # rede/sessão numa execução longa), conn.rollback() nessa conexão
+            # morta lança um psycopg2.InterfaceError SECUNDÁRIO, que mascara
+            # o erro original e ainda quebra o tratamento de erro de quem
+            # chamou esta função (o "raise" abaixo nunca é alcançado, porque
+            # o rollback já lançou antes). Checar conn.closed antes de tentar
+            # rollback/close evita esse efeito colateral.
+            if conn and not conn.closed:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass  # conexão já inutilizável -- nada a fazer aqui, o erro original já vai ser relançado
             logger.info(f"Erro ao inserir os dados na tabela {tabela}: {e}")
             print(f"Erro ao inserir os dados: {e}")
             raise
         finally:
-            if cur:
+            if cur and not cur.closed:
                 cur.close()
-            if conn:
+            if conn and not conn.closed:
                 conn.close()
 
     def mergeia_dados(tabela_origem: str, tabela_destino: str, df: pd.DataFrame, campos_chave: list, logger):
