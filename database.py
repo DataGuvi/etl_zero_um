@@ -90,15 +90,13 @@ class ConnectionDB:
 
         return id
     
-    def insere_dados_bulk(tabela: str, df: pd.DataFrame, logger, normalize_numpy=False):
+    def insere_dados_bulk(tabela: str, df: pd.DataFrame, logger, normalize_numpy=False,
+                           log_progresso=False, page_size=10000):
         try:
             print("salva no banco")
-
+ 
             colunas = ', '.join(df.columns)
-            #placeholders = ', '.join(['%s'] * len(df.columns))
-            #sql = f"INSERT INTO {tabela} ({colunas}) VALUES ({placeholders})"
             sql = f"INSERT INTO {tabela} ({colunas}) VALUES %s"
-            #dados = [tuple(row) for row in df.values]
             if normalize_numpy:
                 dados = [
                     tuple(x.item() if hasattr(x, "item") else x for x in row)
@@ -106,33 +104,46 @@ class ConnectionDB:
                 ]
             else:
                 dados = [tuple(row) for row in df.values]
-
+ 
             logger.info(f"Inserindo {len(dados)} linhas na tabela {tabela}")
             print(f"Inserindo {len(dados)} linhas... as {datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            #execute_batch(cur, sql, dados, page_size=10000)
-            execute_values(cur, sql, dados, page_size=10000)
+ 
+            if log_progresso and len(dados) > page_size:
+                # OTIMIZAÇÃO: mesma técnica de sempre (execute_values em lotes),
+                # só que logando o progresso a cada 10 lotes -- não muda a
+                # performance, só dá visibilidade de que está avançando (em
+                # vez de parecer travado durante inserts de milhões de linhas).
+                # Fica desligado por padrão para não gerar log excessivo em
+                # cargas pequenas do dia a dia (Saldo Diário, etc).
+                total_paginas = -(-len(dados) // page_size)
+                inicio_insert = time.monotonic()
+                for i in range(0, len(dados), page_size):
+                    lote = dados[i:i + page_size]
+                    execute_values(cur, sql, lote, page_size=page_size)
+                    pagina_atual = i // page_size + 1
+                    if pagina_atual % 10 == 0 or pagina_atual == total_paginas:
+                        decorrido = time.monotonic() - inicio_insert
+                        logger.info(
+                            f"Insert em {tabela}: lote {pagina_atual}/{total_paginas} "
+                            f"(~{min(pagina_atual * page_size, len(dados)):,} linhas) — "
+                            f"{decorrido:.0f}s decorridos"
+                        )
+            else:
+                execute_values(cur, sql, dados, page_size=page_size)
+ 
             conn.commit()
         except Exception as e:
-            # CORREÇÃO: se o servidor já derrubou a conexão (ex.: timeout de
-            # rede/sessão numa execução longa), conn.rollback() nessa conexão
-            # morta lança um psycopg2.InterfaceError SECUNDÁRIO, que mascara
-            # o erro original e ainda quebra o tratamento de erro de quem
-            # chamou esta função (o "raise" abaixo nunca é alcançado, porque
-            # o rollback já lançou antes). Checar conn.closed antes de tentar
-            # rollback/close evita esse efeito colateral.
-            if conn and not conn.closed:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass  # conexão já inutilizável -- nada a fazer aqui, o erro original já vai ser relançado
+            if conn:
+                conn.rollback()
             logger.info(f"Erro ao inserir os dados na tabela {tabela}: {e}")
             print(f"Erro ao inserir os dados: {e}")
             raise
         finally:
-            if cur and not cur.closed:
+            if cur:
                 cur.close()
-            if conn and not conn.closed:
+            if conn:
                 conn.close()
+ 
 
     def mergeia_dados(tabela_origem: str, tabela_destino: str, df: pd.DataFrame, campos_chave: list, logger):
         try:

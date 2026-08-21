@@ -17,6 +17,7 @@ import psycopg2
 from agregacao_dim_usuario import executar_agregacao_dim_usuario
 from db_logger import DBLogger
 from agregacao_cohort_retencao import executar_agregacao_cohort_retencao, executar_kpi_diario_datatalk
+from agregacao_bonus import executar_agregacao_bonus_concessoes
 
 class ConsumeAPI:
 
@@ -25,7 +26,8 @@ class ConsumeAPI:
     TETO_CLIENT_ID_METABASE = 50_000_000
  
    
-    def __init__(self, cliente,  modo="incremental", data_final=None, data_inicial_backfill=None, ids_backfill=None):
+    def __init__(self, cliente,  modo="incremental", data_final=None, data_inicial_backfill=None, ids_backfill=None,
+                 partner_id=None):
         self.engine_zro1bet = self.create_engine_zro1bet()
         self.engine_dw = self.create_engine_dw()
         handler = RotatingFileHandler(
@@ -122,6 +124,57 @@ class ConsumeAPI:
                 )
             else:
                 self.backfill_historico_protecao_dados_pessoais('ENERGIABET', data_inicial_backfill, data_final)
+        elif cliente == 'ZEROUM_BACKFILL_BONUS_AWARDING_NULO':
+            # Backfill suplementar de inplay.fact_user_bonus: cobre os
+            # ClientBonus com AwardingTime NULL (achado real: ~9,6M+
+            # registros, majoritariamente Status=6 / BonusType 12,14,15 --
+            # freebet/freespin/riskfree, que não passam por ativação
+            # explícita). Nunca capturados pelo backfill principal
+            # (processa_bonus_backfill, filtrado por AwardingTime).
+            # Reaproveita data_inicial_backfill/data_final como início/fim
+            # do intervalo (por CreationTime).
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ZEROUM_BACKFILL_BONUS_AWARDING_NULO requer --data-inicial-backfill "
+                    "e --data-final (formato YYYY-MM-DDTHH:MM:SS, ex.: 2025-04-11T00:00:00)"
+                )
+            else:
+                self.processa_bonus_backfill_awarding_nulo('ZEROUM', data_inicial_backfill, data_final, partner_id=partner_id)
+        elif cliente == 'ENERGIABET_BACKFILL_BONUS_AWARDING_NULO':
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ENERGIABET_BACKFILL_BONUS_AWARDING_NULO requer --data-inicial-backfill "
+                    "e --data-final (formato YYYY-MM-DDTHH:MM:SS, ex.: 2025-04-11T00:00:00)"
+                )
+            else:
+                self.processa_bonus_backfill_awarding_nulo('ENERGIABET', data_inicial_backfill, data_final, partner_id=partner_id)
+        elif cliente == 'ZEROUM_BONUS':
+            # Carga recorrente (cron diário) de Bônus, ISOLADA do pipeline
+            # horário principal (principal_zeroum). Uso:
+            #   incremental (padrão, agendar diariamente):
+            #     python main.py --cliente ZEROUM_BONUS
+            #   backfill histórico (data de corte explícita):
+            #     python main.py --cliente ZEROUM_BONUS --modo 2025-04-01T00:00:00 --data-final 2025-05-01T00:00:00
+            self.processa_bonus('ZEROUM', modo=modo, data_final=data_final, partner_id=partner_id)
+        elif cliente == 'ENERGIABET_BONUS':
+            # partner_id OBRIGATÓRIO até confirmação -- ver processa_bonus().
+            # Chamar via python -c, não via CLI:
+            #   ConsumeAPI(cliente='ENERGIABET_BONUS', partner_id=<valor confirmado>)
+            self.processa_bonus('ENERGIABET', modo=modo, data_final=data_final, partner_id=partner_id)
+        elif cliente == 'ZEROUM_PIX':
+            # Carga recorrente (cron diário) de Agregação Pix, ISOLADA do
+            # pipeline horário principal (principal_zeroum) e do cron do
+            # Saldo Diário/Bônus — agendar como entrada própria. Uso:
+            #   incremental (padrão, agendar diariamente):
+            #     python main.py --cliente ZEROUM_PIX
+            #   backfill único, obrigatório antes do primeiro incremental:
+            #     ConsumeAPI(cliente='ZEROUM_PIX', modo='full')  # via python -c, não via CLI
+            self.processa_agregacao_pix('ZEROUM', modo=modo, data_final=data_final, partner_id=partner_id)
+        elif cliente == 'ENERGIABET_PIX':
+            # partner_id OBRIGATÓRIO até confirmação -- ver processa_agregacao_pix().
+            # Chamar via python -c, não via CLI:
+            #   ConsumeAPI(cliente='ENERGIABET_PIX', modo='full', partner_id=<valor confirmado>)
+            self.processa_agregacao_pix('ENERGIABET', modo=modo, data_final=data_final, partner_id=partner_id)
         else:
             self.logger.error("Cliente inválido")
 
@@ -1779,7 +1832,7 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
             #        self.logger
             #    )
 
-           #     print(f"Batch {i} → {i + len(chunk)} inserido")
+           #     print(f"Batch {i} -> {i + len(chunk)} inserido")
 
             #print("E - insert finalizado")
 
@@ -3093,6 +3146,299 @@ WHERE _peerdb_is_deleted = 0
         return datetime.combine(dia_inicial + timedelta(days=dias_primeira_metade),
                                  datetime.min.time())
  
+    def processa_agregacao_pix(self, cliente, modo="incremental", partner_id=None, data_final=None):
+        """
+        Carga de inplay.agg_pix_cliente — agregação de PaymentRequest por
+        ClientId/PixKey/PixType (qtd de PaymentRequest Type=1, Status IN
+        (7,8,12), PixKey preenchido).
+
+        Roda 1x/dia, como cliente próprio (ZEROUM_PIX / ENERGIABET_PIX),
+        em cron separado — não integra o pipeline horário existente nem
+        os crons de Saldo Diário/Bônus.
+
+        DECISÃO full x incremental: a origem filtrada (PartnerId=180,
+        Type=1, Status IN (7,8,12), PixKey IS NOT NULL) tem ~77,5M linhas
+        / ~775K grupos resultantes (validado em 17/ago/2026). Rodar o
+        GROUP BY completo todo dia é inviável a médio prazo (a tabela é
+        transacional e só cresce). Optou-se por incremental por "ClientId
+        impactado", no mesmo padrão de agregacao_cohort_retencao.py
+        (recalcula do zero, não faz delta), porque não há garantia de que
+        um PaymentRequest não mude de Status ou PixKey depois de atingir
+        7/8/12 (estorno, reprocessamento etc.) — um delta cego
+        (`count = count + delta`) divergiria silenciosamente nesse
+        cenário.
+
+        A origem (PaymentRequest) é SharedReplacingMergeTree — pode
+        existir mais de uma versão da mesma linha (mesmo Id) até o merge
+        físico do Clickhouse rodar em background. A query sempre
+        deduplica por Id (QUALIFY ROW_NUMBER() ... ORDER BY
+        _peerdb_version DESC) = 1, mesmo padrão do _sql_saldo_diario.
+
+        Type=1 = saque, confirmado empiricamente em 18/ago/2026 via
+        Client.FirstWithdrawalId/LastWithdrawalId (só correlaciona com
+        Type=1) vs Client.FirstDepositId/LastDepositId (só correlaciona
+        com Type=2) — mesmo PartnerId=180 já usado em valida_aposta().
+
+        modo="incremental" (padrão, operação contínua): usa
+        max(updated_at) de inplay.agg_pix_cliente como cursor, filtra a
+        origem por _peerdb_synced_at (CDC) desde esse cursor (com margem
+        de 4h, mesmo padrão de principal_zeroum/processa_saldo_diario),
+        identifica os ClientId impactados nessa janela e recalcula do
+        zero o agrupamento completo (sem filtro de tempo) SÓ para esses
+        ClientId.
+
+        modo="full": recalcula a tabela inteira, sem filtro de tempo.
+        Usar SOMENTE para o backfill inicial (obrigatório antes de rodar
+        em modo incremental — sem isso não há cursor de partida). NÃO
+        rodar em produção diária: o volume de origem inviabiliza. Também
+        serve como reconciliação de segurança se rodado eventualmente
+        (ex.: mensal), pois seu soft-delete varre a tabela inteira, não
+        só os client_id de uma janela.
+
+        SOFT DELETE (não DELETE físico): esta tabela é consumida via
+        endpoint por um cliente/parceiro EXTERNO, que faz um pull
+        completo inicial e depois sincroniza incrementalmente todo dia
+        via `updated_at`. Se um grupo Pix deixasse de existir (ex.:
+        status saiu de 7/8/12) e a linha fosse simplesmente apagada, o
+        parceiro nunca ficaria sabendo — manteria dado obsoleto
+        indefinidamente. Por isso a carga marca `is_active = false` e
+        `deleted_at = <timestamp>` (atualizando `updated_at` junto) em
+        vez de fazer DELETE. O endpoint deve expor os dois campos, e o
+        parceiro deve tratar `is_active = false` como remoção lógica.
+        Grupos reativados (voltaram a existir) são upsertados de volta
+        com `is_active = true`, `deleted_at = NULL`.
+
+        partner_id: PartnerId da origem (PaymentRequest). Se None, usa 180
+        para ZEROUM (valor confirmado em produção, mesmo já usado em
+        valida_aposta()) e 181 para ENERGIABET — este último INFERIDO por
+        analogia (181 é o PartnerId confirmado em produção para
+        ClientBonus/Bonus do Energiabet, ver processa_bonus; PartnerId é
+        um identificador de marca reaproveitado em praticamente todas as
+        tabelas do schema, incluindo PaymentRequest, então é esperado que
+        valha o mesmo — mas isso NÃO foi confirmado diretamente contra
+        PaymentRequest ainda). Recomenda-se validar antes do backfill de
+        ENERGIABET_PIX com a mesma técnica usada para o Type do ZEROUM
+        (correlação via Client.FirstWithdrawalId/LastWithdrawalId, ver
+        documentacao_agregacao_pix.md seção 3.5) — se divergir, informar
+        o valor correto explicitamente via partner_id=<valor correto>.
+
+        data_final (opcional): fecha a janela do modo incremental. Se
+        None, usa datetime.now().
+        """
+        start_time = datetime.now()
+        try:
+            if partner_id is None:
+                if cliente == 'ZEROUM':
+                    partner_id = 180
+                elif cliente == 'ENERGIABET':
+                    partner_id = 181  # inferido por analogia -- ver nota acima
+                else:
+                    raise Exception(
+                        "processa_agregacao_pix('%s', ...): partner_id não informado e "
+                        "não há default conhecido para esse cliente. Confirme o "
+                        "PartnerId correto de PaymentRequest e chame novamente "
+                        "com partner_id=<valor confirmado>." % cliente
+                    )
+
+            self.logger.info(
+                f"Iniciando carga de Agregação Pix - {cliente} (modo={modo}, partner_id={partner_id})"
+            )
+            self.logger.info("Fazendo a autenticação no Metabase")
+            auth_id = self.conection(cliente)
+
+            database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                        if cliente == 'ZEROUM'
+                        else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+            if modo == "incremental":
+                self.logger.info("Recuperando data base para Agregação Pix")
+                ConnectionDB.conecta(DB, cliente)
+                data_importacao = ConnectionDB.recupera_dados(
+                    'inplay.agg_pix_cliente', 'max(updated_at) as updated_at', ''
+                )
+                data_base = data_importacao[0][0]
+
+                if data_base is None:
+                    raise Exception(
+                        "inplay.agg_pix_cliente está vazia. A primeira carga NÃO pode "
+                        "ser incremental (não há cursor de partida). Chame "
+                        "ConsumeAPI(cliente='%s_PIX', modo='full') uma única vez "
+                        "para o backfill antes de ativar o modo incremental." % cliente
+                    )
+
+                # margem de segurança para cobrir latência de sync/relógio,
+                # mesmo padrão usado em principal_zeroum/processa_saldo_diario
+                data_inicial_dt = data_base - timedelta(hours=4)
+                data_final_dt = datetime.fromisoformat(data_final) if data_final else datetime.now()
+
+                data_inicial_str = data_inicial_dt.strftime('%Y-%m-%dT%H:%M:%S')
+                data_final_str = data_final_dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+                self.logger.info(
+                    f"Agregação Pix incremental [_peerdb_synced_at] de "
+                    f"{data_inicial_str} a {data_final_str}"
+                )
+                sql = self._sql_agregacao_pix(
+                    partner_id=partner_id, modo="incremental",
+                    data_inicial=data_inicial_str, data_final=data_final_str
+                )
+            else:
+                self.logger.info("Agregação Pix em modo FULL (backfill) — pode levar minutos")
+                sql = self._sql_agregacao_pix(partner_id=partner_id, modo="full")
+
+            csv = self.extrai_csv_nativo(auth_id, database, sql)
+            df_pix = pd.read_csv(io.BytesIO(csv))
+            df_pix = df_pix.replace({np.nan: None})
+
+            if df_pix.empty:
+                self.logger.info(
+                    "Agregação Pix: nenhum registro impactado na janela atual — nada a carregar"
+                )
+            else:
+                # is_active/deleted_at: a tabela é consumida via endpoint por
+                # um parceiro externo, que faz full inicial + incremental
+                # diário via `updated_at`. Um grupo que deixa de existir
+                # (ex.: status saiu de 7/8/12) precisa ficar sinalizado como
+                # removido — não pode simplesmente sumir da tabela, senão o
+                # parceiro nunca fica sabendo e mantém dado obsoleto (ver
+                # decisão de 17/ago/2026).
+                df_pix['is_active'] = True
+                df_pix['deleted_at'] = None
+
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.deleta_dados('inplay.stg_agregacao_pix_cliente', "", self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_agregacao_pix_cliente', df_pix, self.logger)
+
+                # 1) soft-delete: marca como inativo qualquer grupo que
+                # ESTAVA ativo no destino para o(s) client_id do lote e NÃO
+                # aparece mais no resultado recalculado. Em modo full, o
+                # escopo é a tabela inteira (funciona também como
+                # reconciliação de segurança contra remoções que o
+                # incremental eventualmente não tenha capturado).
+                if modo == "incremental":
+                    client_ids = [int(c) for c in df_pix['client_id'].unique().tolist()]
+                    ids_str = ", ".join(str(c) for c in client_ids)
+                    filtro_escopo_destino = f"AND client_id IN ({ids_str})"
+                else:
+                    filtro_escopo_destino = ""
+
+                sql_soft_delete = f"""
+                    UPDATE inplay.agg_pix_cliente
+                    SET is_active = false,
+                        deleted_at = GETDATE(),
+                        updated_at = GETDATE()
+                    WHERE is_active = true
+                      {filtro_escopo_destino}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM inplay.stg_agregacao_pix_cliente s
+                          WHERE s.client_id = inplay.agg_pix_cliente.client_id
+                            AND s.pix_key = inplay.agg_pix_cliente.pix_key
+                            AND s.pix_type = inplay.agg_pix_cliente.pix_type
+                      )
+                """
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.executa_dml(sql_soft_delete, self.logger)
+
+                # 2) upsert: grupos ainda válidos (ou reativados, se tinham
+                # sido marcados como inativos antes) recebem qtd_transacoes
+                # e updated_at novos; grupos novos são inseridos.
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.mergeia_dados(
+                    'inplay.stg_agregacao_pix_cliente', 'inplay.agg_pix_cliente',
+                    df_pix, ['client_id', 'pix_key', 'pix_type'], self.logger
+                )
+
+            self.logger.info(f"Carga de Agregação Pix concluída com sucesso - {cliente}")
+
+            self.db_logger.log_operation(
+                operation=f'ETL_{cliente}_PIX',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro na carga de Agregação Pix {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation=f'ETL_{cliente}_PIX',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Agregação Pix", body=b)
+            raise
+
+    @staticmethod
+    def _sql_agregacao_pix(partner_id: int, modo: str, data_inicial: str = None, data_final: str = None):
+        """
+        SQL nativo (ClickHouse) para a agregação de PaymentRequest por
+        ClientId/PixKey/PixType. Ver docstring de processa_agregacao_pix
+        para a decisão de design (full vs incremental, dedup).
+
+        modo="incremental": filtra primeiro por ClientId impactado (CTE
+        `impactados`, baseada em _peerdb_synced_at) ANTES de deduplicar
+        por Id — deduplicar só depois de restringir por ClientId evita
+        rodar o ROW_NUMBER() sobre as 77M+ linhas da tabela inteira a
+        cada execução diária (a tabela é ORDER BY Id, não por ClientId,
+        então o filtro de ClientId não pula granules, mas ainda evita o
+        custo do ROW_NUMBER/QUALIFY sobre o volume total).
+
+        modo="full": mesma lógica, sem a CTE de impactados — dedup e
+        agrupamento rodam sobre a tabela inteira. Só para backfill.
+        """
+        filtro_escopo = f"PartnerId = {partner_id} AND Type = 1"
+
+        if modo == "incremental":
+            if not data_inicial or not data_final:
+                raise ValueError("modo='incremental' exige data_inicial e data_final")
+            cte_impactados = f"""impactados AS (
+    SELECT DISTINCT ClientId
+    FROM PaymentRequest
+    WHERE _peerdb_is_deleted = 0
+      AND {filtro_escopo}
+      AND _peerdb_synced_at BETWEEN '{data_inicial}' AND '{data_final}'
+),
+"""
+            filtro_impactados = "AND ClientId IN (SELECT ClientId FROM impactados)"
+        else:
+            cte_impactados = ""
+            filtro_impactados = ""
+
+        return f"""
+WITH {cte_impactados}pr_scope AS (
+    SELECT Id, ClientId, PixKey, PixType, Status, _peerdb_version
+    FROM PaymentRequest
+    WHERE _peerdb_is_deleted = 0
+      AND {filtro_escopo}
+      {filtro_impactados}
+),
+pr_dedup AS (
+    SELECT Id, ClientId, PixKey, PixType, Status, _peerdb_version
+    FROM pr_scope
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY Id
+        ORDER BY _peerdb_version DESC
+    ) = 1
+)
+SELECT
+    ClientId AS client_id,
+    PixKey   AS pix_key,
+    PixType  AS pix_type,
+    count(0) AS qtd_transacoes,
+    now()    AS updated_at,
+    now()    AS import_date
+FROM pr_dedup
+WHERE Status IN (7, 8, 12)
+  AND PixKey IS NOT NULL
+GROUP BY ClientId, PixKey, PixType
+"""
+
     def extrai_dados_card_por_periodo(self, auth_id, id_database, id_card,
                                        data_inicial_dt, data_final_dt,
                                        campo_filtro="updated_at",
@@ -3444,3 +3790,1179 @@ SELECT
 FROM balance_dedup
 GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
 """
+
+    def extrai_fact_user_bonus_por_periodo(self, auth_id, id_database,
+                                        data_inicial_dt, data_final_dt,
+                                        campo_filtro="AwardingTime", filtro_extra="", partner_id=180):
+        data_inicial_str = data_inicial_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        data_final_str = data_final_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        duracao = data_final_dt - data_inicial_dt
+
+        self.logger.info(
+            f"Extraindo fact_user_bonus [SQL nativo, {campo_filtro}{filtro_extra and ', ' + filtro_extra}] de "
+            f"{data_inicial_str} a {data_final_str}"
+        )
+
+        sql = self._sql_fact_user_bonus(data_inicial_str, data_final_str, campo_filtro, filtro_extra, partner_id)
+
+        try:
+            csv = self.extrai_csv_nativo(auth_id, id_database, sql)
+            df = pd.read_csv(io.BytesIO(csv))
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if duracao <= timedelta(seconds=1):
+                self.logger.error(
+                    f"fact_user_bonus: falha de conexão ({type(e).__name__}) na "
+                    f"janela mínima ({data_inicial_str}-{data_final_str}) — não é "
+                    f"possível dividir mais. Erro: {e}"
+                )
+                raise
+            self.logger.warning(
+                f"fact_user_bonus: falha de conexão ({type(e).__name__}) na janela "
+                f"{data_inicial_str}-{data_final_str}. Dividindo ao meio e tentando de novo."
+            )
+            meio = data_inicial_dt + duracao / 2
+            df_primeira_metade = self.extrai_fact_user_bonus_por_periodo(
+                auth_id, id_database, data_inicial_dt, meio, campo_filtro, filtro_extra, partner_id
+            )
+            df_segunda_metade = self.extrai_fact_user_bonus_por_periodo(
+                auth_id, id_database, meio, data_final_dt, campo_filtro, filtro_extra, partner_id
+            )
+            return pd.concat([df_primeira_metade, df_segunda_metade], ignore_index=True)
+
+        if len(df) < self.LIMITE_LINHAS_METABASE:
+            return df
+
+        if duracao <= timedelta(seconds=1):
+            self.logger.warning(
+                f"fact_user_bonus: janela mínima atingida ({data_inicial_str}-"
+                f"{data_final_str}) e ainda assim retornou {len(df)} linhas — "
+                f"possível truncamento residual. Revisar manualmente."
+            )
+            return df
+
+        self.logger.warning(
+            f"fact_user_bonus: {len(df)} linhas (teto do Metabase) para "
+            f"{data_inicial_str}–{data_final_str}. Dividindo a janela ao meio."
+        )
+        meio = data_inicial_dt + duracao / 2
+        df_primeira_metade = self.extrai_fact_user_bonus_por_periodo(
+            auth_id, id_database, data_inicial_dt, meio, campo_filtro, filtro_extra, partner_id
+        )
+        df_segunda_metade = self.extrai_fact_user_bonus_por_periodo(
+            auth_id, id_database, meio, data_final_dt, campo_filtro, filtro_extra, partner_id
+        )
+        return pd.concat([df_primeira_metade, df_segunda_metade], ignore_index=True)
+
+    @staticmethod
+    def _sql_fact_user_bonus(data_inicial, data_final, campo_filtro="AwardingTime",
+                              filtro_extra="", partner_id=180):
+        return f"""
+        WITH bonus_dedup AS
+        (
+            SELECT
+                Id, BonusId, ClientId, PartnerId, Status, SubStatus,
+                BonusPrize, InitialBonusPrize, FinalAmount, TurnoverAmountLeft,
+                ReuseNumber, Cost, CreationTime, AwardingTime, CalculationTime,
+                ValidUntil, TriggerId, RefClientId, _peerdb_synced_at
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+            AND PartnerId = {partner_id}
+            AND {campo_filtro} >= '{data_inicial.replace("T", " ")}' AND {campo_filtro} < '{data_final.replace("T", " ")}'
+            {filtro_extra}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            Id                 AS id,
+            BonusId            AS bonus_id,
+            ClientId           AS client_id,
+            PartnerId          AS partner_id,
+            Status             AS status,
+            SubStatus          AS sub_status,
+            BonusPrize         AS bonus_prize,
+            InitialBonusPrize  AS initial_bonus_prize,
+            FinalAmount        AS final_amount,
+            TurnoverAmountLeft AS turnover_amount_left,
+            ReuseNumber        AS reuse_number,
+            Cost               AS cost,
+            CreationTime       AS creation_time,
+            AwardingTime       AS awarding_time,
+            CalculationTime    AS calculation_time,
+            ValidUntil         AS valid_until,
+            TriggerId          AS trigger_id,
+            RefClientId        AS ref_client_id,
+            _peerdb_synced_at  AS source_updated_at,
+            now()              AS import_date
+        FROM bonus_dedup;
+        """
+
+    @staticmethod
+    def _sql_dim_bonus(partner_id=180):
+        # Achado da validação: Bonus também tem CDC (594 linhas vs. 406 Ids
+        # distintos) -- precisa de dedup igual fact_user_bonus, sem filtro de
+        # período (tabela pequena, ~600 linhas).
+        # Filtro PartnerId: mesma lógica de fact_user_bonus -- escopo de
+        # relevância, confirmado no-op nos dados atuais do ZEROUM (180),
+        # mantido como proteção. CONFERIR o valor correto antes de rodar
+        # para ENERGIABET -- pode não ser 180.
+        #
+        # Sem prefixo de schema (ex.: "partner_zeroum.") de propósito --
+        # mesmo padrão de _sql_saldo_diario/_sql_agregacao_pix: a conexão
+        # Metabase (parâmetro `database` em extrai_csv_nativo) já resolve
+        # a origem correta por cliente. Um prefixo fixo aqui faria a
+        # query sempre ler do ZEROUM, mesmo quando conectada via ENERGIABET
+        # (achado de 18/ago/2026 -- ver processa_bonus).
+        return f"""
+        WITH dim_bonus_dedup AS
+        (
+            SELECT
+                Id, Name, BonusType, Status, StartTime, FinishTime,
+                ValidForAwarding, ValidForSpending, TurnoverCount,
+                MinAmount, MaxAmount, Percent, AutoClaim,
+                CreationTime, LastUpdateTime, _peerdb_synced_at
+            FROM Bonus
+            WHERE _peerdb_is_deleted = 0
+              AND PartnerId = {partner_id}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            Id               AS bonus_id,
+            Name             AS bonus_name,
+            BonusType        AS bonus_type,
+            Status           AS active,
+            StartTime        AS start_date,
+            FinishTime       AS end_date,
+            ValidForAwarding AS valid_for_awarding,
+            ValidForSpending AS valid_for_spending,
+            TurnoverCount    AS turnover_count,
+            MinAmount        AS min_amount,
+            MaxAmount        AS max_amount,
+            Percent          AS bonus_percent,
+            AutoClaim        AS auto_claim,
+            CreationTime     AS creation_time,
+            LastUpdateTime   AS last_update_time,
+            now()            AS import_date
+        FROM dim_bonus_dedup;
+        """
+
+    @staticmethod
+    def _sql_bridge_bonus_product(partner_id=180):
+        # Dedup aplicado por padrão/segurança, mesmo com validação atual
+        # (372=372) sem duplicidade -- protege contra futuras atualizações
+        # em BonusProduct e mantém consistência com dim_bonus/fact_user_bonus.
+        # BonusProduct não tem PartnerId próprio -- escopo aplicado
+        # indiretamente via BonusId, restrito aos bônus que pertencem ao
+        # parceiro informado (join contra Bonus, mesmo filtro usado em
+        # dim_bonus). Sem prefixo de schema -- ver nota em _sql_dim_bonus.
+        return f"""
+        WITH bridge_dedup AS
+        (
+            SELECT
+                bp.Id, bp.BonusId, bp.ProductId, bp.CashBackPercent, bp.FreeSpinCost,
+                bp._peerdb_synced_at
+            FROM BonusProduct bp
+            INNER JOIN Bonus b
+                ON bp.BonusId = b.Id
+                AND b._peerdb_is_deleted = 0
+                AND b.PartnerId = {partner_id}
+            WHERE bp._peerdb_is_deleted = 0
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY bp.Id
+                ORDER BY bp._peerdb_version DESC, bp._peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            Id              AS id,
+            BonusId         AS bonus_id,
+            ProductId       AS product_id,
+            CashBackPercent AS cashback_percent,
+            FreeSpinCost    AS free_spin_cost,
+            now()           AS import_date
+        FROM bridge_dedup;
+        """
+
+    def processa_bonus(self, cliente, modo="incremental", data_final=None, carregar_dimensoes=True,
+                        campo_filtro_override=None, filtro_extra="", partner_id=None):
+        """
+        Carga isolada de Bônus (ClientBonus / Bonus / BonusProduct).
+
+        Não é chamada por principal_zeroum()/principal_energiabet() — roda
+        como cliente próprio (ZEROUM_BONUS / ENERGIABET_BONUS), em cron
+        separado, sem tocar nas tabelas do pipeline horário existente.
+
+        modo="incremental" (padrão): usa max(source_updated_at) de
+        inplay.fact_user_bonus e filtra a origem por _peerdb_synced_at
+        (cursor CDC) — correto para operação contínua.
+
+        modo="<DATA_ISO>" (ex.: "2025-04-01T00:00:00"): usado para backfill
+        histórico. Filtra a origem por AwardingTime (data de negócio), NÃO
+        por _peerdb_synced_at — mesma razão do Saldo Diário: cargas em lote
+        sincronizam tudo com o mesmo timestamp.
+
+        data_final (opcional): fecha a janela em modo de backfill. Se None
+        em modo backfill, extrai até agora.
+
+        carregar_dimensoes (opcional, default True): se False, PULA a carga
+        de dim_bonus/bridge_bonus_product. OTIMIZAÇÃO para backfill em
+        blocos -- essas 2 tabelas são pequenas e não mudam bloco a bloco,
+        recarregar em toda chamada desperdiça um round-trip completo ao
+        Metabase + delete + insert + merge. processa_bonus_backfill já usa
+        isso automaticamente (só carrega no primeiro bloco).
+
+        campo_filtro_override (opcional): força um campo de filtro
+        específico, IGNORANDO a regra automática (_peerdb_synced_at no
+        incremental, AwardingTime no backfill). Usado pelo backfill
+        suplementar de registros com AwardingTime NULL (ver
+        processa_bonus_backfill_awarding_nulo).
+
+        filtro_extra (opcional): condição SQL adicional (ex.: "AND
+        AwardingTime IS NULL") repassada para _sql_fact_user_bonus. Default
+        vazio -- não afeta o comportamento existente.
+
+        partner_id (opcional): PartnerId de origem (ClientBonus/Bonus/
+        BonusProduct). Se None, usa 180 para ZEROUM (valor confirmado em
+        produção) -- para ENERGIABET, CONFERIR e informar explicitamente
+        antes de rodar; não há default seguro conhecido ainda (achado de
+        18/ago/2026: as três queries de Bônus estavam com "partner_zeroum."
+        e "PartnerId = 180" fixos no código, nunca antes parametrizados
+        para ENERGIABET_BONUS -- corrigido nesta revisão).
+        """
+        try:
+            start_time = datetime.now()
+
+            if partner_id is None:
+                if cliente == 'ZEROUM':
+                    partner_id = 180
+                elif cliente == 'ENERGIABET':
+                    partner_id = 181
+                else:
+                    raise Exception(
+                        "processa_bonus('%s', ...): partner_id não informado e não há "
+                        "default seguro para esse cliente. Confirme o PartnerId correto "
+                        "de ClientBonus/Bonus/BonusProduct e chame novamente com "
+                        "partner_id=<valor confirmado>." % cliente
+                    )
+
+            self.logger.info(
+                f"Iniciando carga de Bônus - {cliente} (modo={modo}, data_final={data_final}, partner_id={partner_id})"
+            )
+            self.logger.info("Fazendo a autenticação no Metabase")
+            auth_id = self.conection(cliente)
+
+            database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                        if cliente == 'ZEROUM'
+                        else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+            if carregar_dimensoes:
+                # ================================================================
+                # 1. DIM_BONUS — carga completa (tabela pequena, ~600 linhas)
+                # ================================================================
+                self.logger.info("Extraindo dim_bonus (carga completa)")
+                sql_dim = self._sql_dim_bonus(partner_id=partner_id)
+                csv_dim = self.extrai_csv_nativo(auth_id, database, sql_dim)
+                df_dim_bonus = pd.read_csv(io.BytesIO(csv_dim))
+                df_dim_bonus = df_dim_bonus.replace({np.nan: None})
+
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.deleta_dados('inplay.stg_dim_bonus', "", self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_dim_bonus', df_dim_bonus, self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.mergeia_dados(
+                    'inplay.stg_dim_bonus', 'inplay.dim_bonus',
+                    df_dim_bonus, ['bonus_id'], self.logger
+                )
+                self.logger.info(f"dim_bonus: {len(df_dim_bonus)} linhas carregadas")
+
+                # ================================================================
+                # 2. BRIDGE_BONUS_PRODUCT — carga completa
+                # ================================================================
+                self.logger.info("Extraindo bridge_bonus_product (carga completa)")
+                sql_bridge = self._sql_bridge_bonus_product(partner_id=partner_id)
+                csv_bridge = self.extrai_csv_nativo(auth_id, database, sql_bridge)
+                df_bridge = pd.read_csv(io.BytesIO(csv_bridge))
+                df_bridge = df_bridge.replace({np.nan: None})
+
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.deleta_dados('inplay.stg_bridge_bonus_product', "", self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_bridge_bonus_product', df_bridge, self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.mergeia_dados(
+                    'inplay.stg_bridge_bonus_product', 'inplay.bridge_bonus_product',
+                    df_bridge, ['id'], self.logger
+                )
+                self.logger.info(f"bridge_bonus_product: {len(df_bridge)} linhas carregadas")
+            else:
+                self.logger.info("Pulando dim_bonus/bridge_bonus_product (carregar_dimensoes=False)")
+
+            # ================================================================
+            # 3. FACT_USER_BONUS — chunking automático por período
+            # ================================================================
+            campo_filtro_periodo = campo_filtro_override or (
+                "_peerdb_synced_at" if modo == "incremental" else "AwardingTime"
+            )
+
+            if modo == "incremental":
+                self.logger.info("Recuperando data base para fact_user_bonus")
+                ConnectionDB.conecta(DB, cliente)
+                data_importacao = ConnectionDB.recupera_dados(
+                    'inplay.fact_user_bonus', 'max(source_updated_at) as source_updated_at', ''
+                )
+                data_base = data_importacao[0][0]
+
+                if data_base is None:
+                    raise Exception(
+                        "inplay.fact_user_bonus está vazia. A primeira carga NÃO pode "
+                        "ser incremental. Chame ConsumeAPI(...).processa_bonus('%s', "
+                        "modo='<DATA_CORTE_ISO>'), ex.: modo='2025-04-01T00:00:00', "
+                        "informando uma data de corte explícita antes de rodar em "
+                        "modo incremental." % cliente
+                    )
+                data_inicial_dt = data_base - timedelta(hours=4)
+            else:
+                data_inicial_dt = datetime.fromisoformat(modo)
+
+            data_final_dt = datetime.fromisoformat(data_final) if data_final else datetime.now()
+
+            self.logger.info(
+                f"Extraindo fact_user_bonus [{campo_filtro_periodo}] de "
+                f"{data_inicial_dt} a {data_final_dt}"
+            )
+            df_fact_bonus = self.extrai_fact_user_bonus_por_periodo(
+                auth_id, database, data_inicial_dt, data_final_dt,
+                campo_filtro=campo_filtro_periodo, filtro_extra=filtro_extra, partner_id=partner_id
+            )
+            df_fact_bonus = df_fact_bonus.replace({np.nan: None})
+
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados('inplay.stg_fact_user_bonus', "", self.logger)
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_bonus', df_fact_bonus, self.logger)
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.mergeia_dados(
+                'inplay.stg_fact_user_bonus', 'inplay.fact_user_bonus',
+                df_fact_bonus, ['id'], self.logger
+            )
+            self.logger.info(f"fact_user_bonus: {len(df_fact_bonus)} linhas carregadas")
+
+            # ================================================================
+            # 4. AGG_BONUS_CONCESSOES — atualização incremental da visão
+            #    agrupada bruta (client_id + bonus_id), consumida pelo
+            #    endpoint de concessões (equivalente ao relatório de PIX).
+            #    Recalcula SÓ os pares impactados nesta carga, não a tabela
+            #    inteira. Falha aqui não derruba a carga de fact_user_bonus,
+            #    que já está commitada neste ponto.
+            #
+            #    partner_id não precisa ser repassado aqui: o módulo deriva
+            #    o partner_id de cada grupo a partir de fact_user_bonus (já
+            #    carregado corretamente por cliente), não faz nenhuma
+            #    extração adicional do Clickhouse/Metabase -- por isso não
+            #    está sujeito ao mesmo bug de schema/PartnerId fixo que
+            #    afetou as demais queries de Bônus (achado de 19/ago/2026).
+            # ================================================================
+            executar_agregacao_bonus_concessoes(df_fact_bonus, cliente, DB, self.logger)
+
+            self.logger.info(f"Carga de Bônus concluída com sucesso - {cliente}")
+            self.db_logger.log_operation(
+                operation='ETL_BONUS',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro de rede na carga de Bônus {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation='ETL_BONUS',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Bônus", body=b)
+            raise Exception(f"Erro na carga de Bônus {cliente}: {e}")
+        except Exception as e:
+            self.logger.error(f"Erro na carga de Bônus {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation='ETL_BONUS',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Bônus", body=b)
+            raise
+
+    def _perfil_diario_bonus(self, cliente, data_inicial_dt, data_final_dt, partner_id=180):
+        """
+        OTIMIZAÇÃO: roda UMA query leve (COUNT(*) agrupado por dia) cobrindo
+        todo o intervalo do backfill, em vez de descobrir o volume "na
+        marra" (baixar até estourar o teto, descartar, dividir, tentar de
+        novo -- o padrão caro que causava lentidão: 4 downloads de ~1M
+        linhas cada, jogados fora, só para um único bloco de 30 dias).
+ 
+        Retorna uma lista de tuplas (data: date, contagem: int), ordenada.
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+ 
+        data_ini_str = data_inicial_dt.strftime('%Y-%m-%d')
+        data_fim_str = data_final_dt.strftime('%Y-%m-%d')
+ 
+        # Nota: este COUNT conta linhas ANTES do dedup por Id (não usa
+        # QUALIFY) -- é uma superestimativa leve (inclui versões antigas de
+        # CDC), o que é seguro aqui: preferimos janelas um pouco menores do
+        # que o necessário a estourar o teto de novo. O custo desse
+        # over-estimate é pequeno dado que a duplicidade de ClientBonus é
+        # ~0,8%, não muda a ordem de grandeza.
+        #
+        # Sem prefixo de schema (achado de 19/ago/2026: "partner_zeroum."
+        # fixo aqui fazia o backfill do ENERGIABET tentar ler
+        # partner_zeroum.ClientBonus e falhar com ACCESS_DENIED -- a
+        # conexão do Metabase (`database`, acima) já resolve a origem
+        # certa por cliente, mesmo padrão de _sql_fact_user_bonus).
+        sql_perfil = f"""
+        SELECT
+            toDate(AwardingTime) AS dia,
+            COUNT(*) AS total
+        FROM ClientBonus
+        WHERE _peerdb_is_deleted = 0
+          AND PartnerId = {partner_id}
+          AND toDate(AwardingTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+        GROUP BY dia
+        ORDER BY dia
+        """
+        csv_perfil = self.extrai_csv_nativo(auth_id, database, sql_perfil)
+        df_perfil = pd.read_csv(io.BytesIO(csv_perfil))
+        df_perfil['dia'] = pd.to_datetime(df_perfil['dia']).dt.date
+ 
+        return list(df_perfil.itertuples(index=False, name=None))
+
+    def _perfil_diario_bonus_generico(self, cliente, data_inicial_dt, data_final_dt,
+                                   campo_data="CreationTime", filtro_extra="", partner_id=180):
+        """
+        Igual _perfil_diario_bonus, mas parametrizável -- usada pelo backfill
+        suplementar de registros com AwardingTime NULL, que precisa perfilar
+        por CreationTime (sempre preenchido) e escopar só o universo faltante.
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = data_inicial_dt.strftime('%Y-%m-%d')
+        data_fim_str = data_final_dt.strftime('%Y-%m-%d')
+
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        sql_perfil = f"""
+        SELECT
+            toDate({campo_data}) AS dia,
+            COUNT(*) AS total
+        FROM ClientBonus
+        WHERE _peerdb_is_deleted = 0
+        AND PartnerId = {partner_id}
+        AND toDate({campo_data}) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+        {filtro_extra}
+        GROUP BY dia
+        ORDER BY dia
+        """
+        csv_perfil = self.extrai_csv_nativo(auth_id, database, sql_perfil)
+        df_perfil = pd.read_csv(io.BytesIO(csv_perfil))
+        df_perfil['dia'] = pd.to_datetime(df_perfil['dia']).dt.date
+
+        return list(df_perfil.itertuples(index=False, name=None))
+ 
+    @staticmethod
+    def _monta_janelas_por_volume(perfil_diario, limite_linhas=900000):
+        """
+        Agrupa dias consecutivos em janelas cuja soma de linhas fica abaixo
+        de `limite_linhas` (com margem de segurança sob LIMITE_LINHAS_METABASE
+        = 1.048.575 -- 900K deixa ~15% de folga para o dedup por Id não
+        reduzir tanto quanto o esperado, e para dias com pico de volume).
+ 
+        Retorna lista de tuplas (data_inicio: date, data_fim: date).
+        """
+        if not perfil_diario:
+            return []
+ 
+        janelas = []
+        inicio_janela = perfil_diario[0][0]
+        soma_atual = 0
+        fim_janela = inicio_janela
+ 
+        for dia, total in perfil_diario:
+            if soma_atual + total > limite_linhas and soma_atual > 0:
+                janelas.append((inicio_janela, fim_janela))
+                inicio_janela = dia
+                soma_atual = 0
+            soma_atual += total
+            fim_janela = dia
+ 
+        janelas.append((inicio_janela, fim_janela))
+        return janelas
+ 
+    def processa_bonus_backfill(self, cliente, data_inicio_historico, data_corte,
+                                 tamanho_bloco_dias=None, validar_blocos=True,
+                                 limite_linhas_por_janela=900000, partner_id=None):
+        """
+        Carga histórica (backfill) de Bônus, com janelas dimensionadas pelo
+        volume real de cada período (não por um número fixo de dias).
+ 
+        Parâmetros:
+            cliente: 'ZEROUM' ou 'ENERGIABET'
+            data_inicio_historico: string ISO, ex. '2023-01-01T00:00:00'
+            data_corte: string ISO, ex. '2025-08-01T00:00:00'
+            tamanho_bloco_dias: se informado (int), volta ao comportamento
+                ANTIGO de blocos fixos em dias, ignorando o perfil de
+                volume -- útil como fallback se a query de perfil falhar
+                por algum motivo. Default None = usa o modo otimizado
+                (recomendado).
+            validar_blocos: mesma semântica de antes (fail-fast por bloco).
+            limite_linhas_por_janela: teto de linhas por janela ao usar o
+                modo otimizado (default 900.000, com margem sob o teto real
+                do Metabase de 1.048.575).
+ 
+        Retomada após falha: mesma lógica de antes -- o log de erro traz a
+        data exata pra retomar.
+        """
+        data_atual = datetime.fromisoformat(data_inicio_historico)
+        data_corte_dt = datetime.fromisoformat(data_corte)
+ 
+        if data_atual >= data_corte_dt:
+            raise ValueError(
+                f"data_inicio_historico ({data_atual}) precisa ser anterior "
+                f"a data_corte ({data_corte_dt})."
+            )
+
+        if partner_id is None:
+            if cliente == 'ZEROUM':
+                partner_id = 180
+            elif cliente == 'ENERGIABET':
+                partner_id = 181
+            else:
+                raise Exception(
+                    "processa_bonus_backfill('%s', ...): partner_id não informado "
+                    "e não há default conhecido para esse cliente. Confirme o "
+                    "PartnerId correto e chame novamente com "
+                    "partner_id=<valor confirmado>." % cliente
+                )
+ 
+        if tamanho_bloco_dias is not None:
+            # Modo fallback: blocos fixos em dias (comportamento antigo)
+            bloco = timedelta(days=tamanho_bloco_dias)
+            janelas = []
+            cursor = data_atual
+            while cursor < data_corte_dt:
+                fim = min(cursor + bloco, data_corte_dt)
+                janelas.append((cursor.date(), fim.date()))
+                cursor = fim
+            self.logger.info(
+                f"[BACKFILL BÔNUS] Modo fallback (blocos fixos de "
+                f"{tamanho_bloco_dias} dias) — {len(janelas)} blocos"
+            )
+        else:
+            # Modo otimizado: 1 query de perfil, janelas dimensionadas por volume
+            self.logger.info(
+                "[BACKFILL BÔNUS] Calculando perfil de volume diário "
+                "(1 query, evita downloads desperdiçados)..."
+            )
+            perfil = self._perfil_diario_bonus(cliente, data_atual, data_corte_dt, partner_id=partner_id)
+            janelas_data = self._monta_janelas_por_volume(perfil, limite_linhas_por_janela)
+            # Converter (date, date) em (datetime, datetime) no formato que
+            # processa_bonus espera, com o fim de cada janela avançado 1 dia
+            # (já que a janela é [inicio, fim] inclusivo por dia).
+            janelas = [
+                (datetime.combine(ini, datetime.min.time()),
+                 datetime.combine(fim, datetime.min.time()) + timedelta(days=1))
+                for ini, fim in janelas_data
+            ]
+            total_linhas_perfil = sum(t for _, t in perfil)
+            self.logger.info(
+                f"[BACKFILL BÔNUS] Perfil calculado: {len(perfil)} dias, "
+                f"~{total_linhas_perfil} linhas totais (antes de dedup), "
+                f"{len(janelas)} janelas de até {limite_linhas_por_janela} linhas cada"
+            )
+ 
+        total_blocos_previsto = len(janelas)
+        self.logger.info(
+            f"[BACKFILL BÔNUS] Iniciando — {cliente}, de {data_atual} até "
+            f"{data_corte_dt}, {total_blocos_previsto} janelas previstas"
+        )
+ 
+        inicio_execucao = time.monotonic()
+        total_blocos = 0
+        for data_ini_bloco, data_fim_bloco in janelas:
+            total_blocos += 1
+            inicio_bloco = time.monotonic()
+ 
+            self.logger.info(
+                f"[BACKFILL BÔNUS] Bloco {total_blocos}/{total_blocos_previsto}: "
+                f"{data_ini_bloco.strftime('%Y-%m-%d')} -> {data_fim_bloco.strftime('%Y-%m-%d')}"
+            )
+ 
+            # OTIMIZAÇÃO/RESILIÊNCIA: retry automático para erros
+            # TRANSITÓRIOS de conexão (server closed the connection
+            # unexpectedly, etc.) -- diferente de bugs de lógica, esses
+            # acontecem ocasionalmente em execuções longas (cluster,
+            # VPN/firewall, blip de rede) e não são "culpa" do código. Como
+            # o MERGE é idempotente, é seguro tentar o mesmo bloco de novo.
+            MAX_TENTATIVAS_BLOCO = 3
+            ERROS_TRANSITORIOS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+ 
+            for tentativa in range(1, MAX_TENTATIVAS_BLOCO + 1):
+                try:
+                    self.processa_bonus(
+                        cliente,
+                        modo=data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        data_final=data_fim_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        carregar_dimensoes=(total_blocos == 1),  # só no primeiro bloco
+                        partner_id=partner_id
+                    )
+                    break  # sucesso, sai do loop de retry
+                except ERROS_TRANSITORIOS as e:
+                    if tentativa >= MAX_TENTATIVAS_BLOCO:
+                        self.logger.error(
+                            f"[BACKFILL BÔNUS] Bloco {data_ini_bloco.strftime('%Y-%m-%d')} "
+                            f"-> {data_fim_bloco.strftime('%Y-%m-%d')} falhou {MAX_TENTATIVAS_BLOCO}x "
+                            f"por erro de conexão. Para retomar, chame "
+                            f"processa_bonus_backfill(cliente='{cliente}', "
+                            f"data_inicio_historico='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}', "
+                            f"data_corte='{data_corte}'). Erro: {e}"
+                        )
+                        raise
+                    espera = 30 * tentativa  # 30s, depois 60s
+                    self.logger.warning(
+                        f"[BACKFILL BÔNUS] Erro de conexão no bloco "
+                        f"{data_ini_bloco.strftime('%Y-%m-%d')} (tentativa {tentativa}/"
+                        f"{MAX_TENTATIVAS_BLOCO}): {type(e).__name__}: {e}. "
+                        f"Tentando de novo em {espera}s..."
+                    )
+                    time.sleep(espera)
+                except Exception as e:
+                    # Erros que NÃO são de conexão (ex.: validação de dado,
+                    # erro de programação) não devem ser retentados
+                    # cegamente -- param imediatamente, igual antes.
+                    self.logger.error(
+                        f"[BACKFILL BÔNUS] Falhou no bloco {data_ini_bloco.strftime('%Y-%m-%d')} "
+                        f"-> {data_fim_bloco.strftime('%Y-%m-%d')}. Para retomar, chame "
+                        f"processa_bonus_backfill(cliente='{cliente}', "
+                        f"data_inicio_historico='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}', "
+                        f"data_corte='{data_corte}'). Erro: {e}"
+                    )
+                    raise
+ 
+            if validar_blocos:
+                self._valida_bloco_bonus(cliente, data_ini_bloco, data_fim_bloco - timedelta(days=1), partner_id=partner_id)
+ 
+            duracao_bloco = time.monotonic() - inicio_bloco
+            tempo_decorrido = time.monotonic() - inicio_execucao
+            media_por_bloco = tempo_decorrido / total_blocos
+            blocos_restantes = max(total_blocos_previsto - total_blocos, 0)
+            eta_restante = media_por_bloco * blocos_restantes
+ 
+            self.logger.info(
+                f"[BACKFILL BÔNUS] Bloco {total_blocos}/{total_blocos_previsto} OK em "
+                f"{self._formata_duracao(duracao_bloco)} | decorrido: "
+                f"{self._formata_duracao(tempo_decorrido)} | média/bloco: "
+                f"{self._formata_duracao(media_por_bloco)} | restante (estimado): "
+                f"{self._formata_duracao(eta_restante)}"
+            )
+ 
+        tempo_total = time.monotonic() - inicio_execucao
+        self.logger.info(
+            f"[BACKFILL BÔNUS] Concluído — {total_blocos} blocos processados, "
+            f"{cliente}, até {data_corte_dt.strftime('%Y-%m-%d')}, "
+            f"tempo total: {self._formata_duracao(tempo_total)}"
+        )
+ 
+    @staticmethod
+    def _formata_duracao(segundos):
+        return str(timedelta(seconds=int(segundos)))
+ 
+    def _valida_bloco_bonus(self, cliente, data_inicio_bloco, data_fim_bloco, partner_id=180):
+        """
+        Validação automática de um bloco do backfill: compara a contagem
+        de linhas na origem (ClientBonus, já deduplicado) com a contagem
+        na tabela destino (fact_user_bonus), na mesma janela de
+        AwardingTime. Mesma lógica do Passo 6 do guia, só que automática.
+ 
+        Se não bater, loga ERROR e levanta exceção — o backfill para nesse
+        bloco em vez de seguir acumulando dados possivelmente incorretos.
+ 
+        ⚠️ CORREÇÃO IMPORTANTE (achado real, validado com dados de produção):
+        a query do destino usa `awarding_time >= data_ini AND awarding_time
+        < data_fim_exclusivo` (limite superior EXCLUSIVO), não
+        `BETWEEN data_ini AND data_fim`. O motivo: `awarding_time` é
+        TIMESTAMP (tem hora), e comparar com uma string de data pura
+        (ex. '2025-05-11') faz o Redshift interpretar isso como
+        '2025-05-11 00:00:00' — ou seja, um `BETWEEN` com limite superior
+        assim exclui quase o dia inteiro do limite superior (só pega
+        registros que caíram exatamente à meia-noite). Isso gerou um falso
+        positivo de "perda de dados" (288.506 na origem vs. 269.464 no
+        destino) quando na real os dados estavam 100% corretos — só a
+        validação estava comparando errado. A origem já não tinha esse
+        problema porque usa `toDate(AwardingTime) BETWEEN ...`, que trunca
+        a hora antes de comparar.
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+ 
+        data_ini_str = data_inicio_bloco.strftime('%Y-%m-%d')
+        data_fim_str = data_fim_bloco.strftime('%Y-%m-%d')
+ 
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        sql_origem = f"""
+        SELECT COUNT(*) AS total FROM (
+            SELECT Id
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+              AND PartnerId = {partner_id}
+              AND toDate(AwardingTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        """
+        csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem)
+        df_origem = pd.read_csv(io.BytesIO(csv_origem))
+        total_origem = int(df_origem['total'].iloc[0])
+ 
+        # Limite superior EXCLUSIVO e um dia à frente, para cobrir o dia
+        # data_fim_str por completo (24h), igual ao toDate() BETWEEN faz
+        # do lado da origem. Ex.: data_fim_str='2025-05-11' -> filtro pega
+        # tudo até '2025-05-12 00:00:00' (exclusivo).
+        data_fim_exclusivo_str = (data_fim_bloco + timedelta(days=1)).strftime('%Y-%m-%d')
+ 
+        ConnectionDB.conecta(DB, cliente)
+        resultado_destino = ConnectionDB.recupera_dados(
+            'inplay.fact_user_bonus',
+            'COUNT(*)',
+            f"WHERE partner_id = {partner_id} AND awarding_time >= '{data_ini_str}' AND awarding_time < '{data_fim_exclusivo_str}'"
+        )
+        total_destino = resultado_destino[0][0]
+ 
+        if total_origem != total_destino:
+            self.logger.error(
+                f"[BACKFILL BÔNUS] VALIDAÇÃO FALHOU no bloco {data_ini_str}-{data_fim_str}: "
+                f"origem={total_origem}, destino={total_destino} (diferença={total_origem - total_destino})"
+            )
+            raise Exception(
+                f"Validação de contagem falhou no bloco {data_ini_str}-{data_fim_str}: "
+                f"origem={total_origem} x destino={total_destino}"
+            )
+ 
+        self.logger.info(
+            f"[BACKFILL BÔNUS] Bloco {data_ini_str}-{data_fim_str} validado OK "
+            f"({total_origem} linhas em ambos os lados)"
+        )
+
+    @staticmethod
+    def _sql_trigger_ref_backfill(data_inicial, data_final, campo_filtro="AwardingTime", partner_id=180):
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        return f"""
+        WITH bonus_dedup AS
+        (
+            SELECT Id, TriggerId, RefClientId, _peerdb_synced_at
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+            AND PartnerId = {partner_id}
+            AND {campo_filtro} >= '{data_inicial.replace("T", " ")}' AND {campo_filtro} < '{data_final.replace("T", " ")}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            Id          AS id,
+            TriggerId   AS trigger_id,
+            RefClientId AS ref_client_id
+        FROM bonus_dedup;
+        """
+
+    def backfill_trigger_ref_client(self, cliente, data_inicio_historico, data_corte,
+                                    limite_linhas_por_janela=900000, partner_id=None):
+        """
+        Backfill pontual de trigger_id/ref_client_id em inplay.fact_user_bonus,
+        para o período JÁ carregado antes da inclusão dessas 2 colunas em
+        _sql_fact_user_bonus. Reaproveita o perfil de volume/janelas já usado
+        em processa_bonus_backfill -- mesma fonte (ClientBonus), então o
+        dimensionamento das janelas é idêntico.
+
+        Roda UPDATE direto (não merge/insert): os Ids já existem em
+        fact_user_bonus, só falta popular as 2 colunas novas.
+        """
+        data_atual = datetime.fromisoformat(data_inicio_historico)
+        data_corte_dt = datetime.fromisoformat(data_corte)
+
+        if partner_id is None:
+            if cliente == 'ZEROUM':
+                partner_id = 180
+            elif cliente == 'ENERGIABET':
+                partner_id = 181
+            else:
+                raise Exception(
+                    "backfill_trigger_ref_client('%s', ...): partner_id não "
+                    "informado e não há default conhecido para esse cliente. "
+                    "Chame novamente com partner_id=<valor confirmado>." % cliente
+                )
+
+        self.logger.info(
+            f"[BACKFILL trigger_id/ref_client_id] Calculando perfil de volume "
+            f"({data_atual} a {data_corte_dt})..."
+        )
+        perfil = self._perfil_diario_bonus(cliente, data_atual, data_corte_dt, partner_id=partner_id)
+        janelas_data = self._monta_janelas_por_volume(perfil, limite_linhas_por_janela)
+        janelas = [
+            (datetime.combine(ini, datetime.min.time()),
+            datetime.combine(fim, datetime.min.time()) + timedelta(days=1))
+            for ini, fim in janelas_data
+        ]
+
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        total = len(janelas)
+        for i, (ini, fim) in enumerate(janelas, start=1):
+            self.logger.info(
+                f"[BACKFILL trigger_id/ref_client_id] Janela {i}/{total}: "
+                f"{ini.strftime('%Y-%m-%d')} -> {fim.strftime('%Y-%m-%d')}"
+            )
+            sql = self._sql_trigger_ref_backfill(
+                ini.strftime('%Y-%m-%dT%H:%M:%S'),
+                fim.strftime('%Y-%m-%dT%H:%M:%S'),
+                partner_id=partner_id
+            )
+            csv = self.extrai_csv_nativo(auth_id, database, sql)
+            df = pd.read_csv(io.BytesIO(csv)).replace({np.nan: None})
+
+            if df.empty:
+                continue
+
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados('inplay.stg_backfill_trigger_ref_bonus', "", self.logger)
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.insere_dados_bulk('inplay.stg_backfill_trigger_ref_bonus', df, self.logger)
+
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.executa_dml(
+                """
+                UPDATE inplay.fact_user_bonus fub
+                SET trigger_id    = stg.trigger_id,
+                    ref_client_id = stg.ref_client_id
+                FROM inplay.stg_backfill_trigger_ref_bonus stg
+                WHERE fub.id = stg.id
+                """,
+                self.logger
+            )
+            self.logger.info(f"[BACKFILL trigger_id/ref_client_id] Janela {i}/{total}: {len(df)} linhas atualizadas")
+
+        self.logger.info("[BACKFILL trigger_id/ref_client_id] Concluído.")
+
+    def valida_historico_bonus_total(self, cliente, data_inicio_historico, data_corte, partner_id=180):
+        """
+        Confere total geral (origem x destino) para todo o período do backfill.
+        Rápido, mas não localiza EM QUAL dia está a diferença, se houver.
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = datetime.fromisoformat(data_inicio_historico).strftime('%Y-%m-%d')
+        data_fim_str = datetime.fromisoformat(data_corte).strftime('%Y-%m-%d')
+
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        sql_origem = f"""
+        SELECT COUNT(*) AS total FROM (
+            SELECT Id
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+            AND PartnerId = {partner_id}
+            AND toDate(AwardingTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        """
+        csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem)
+        total_origem = int(pd.read_csv(io.BytesIO(csv_origem))['total'].iloc[0])
+
+        ConnectionDB.conecta(DB, cliente)
+        resultado_destino = ConnectionDB.recupera_dados(
+            'inplay.fact_user_bonus', 'COUNT(*)',
+            f"WHERE partner_id = {partner_id} "
+            f"AND awarding_time >= '{data_ini_str}' AND awarding_time < '{data_fim_str}'::date + 1"
+        )
+        total_destino = resultado_destino[0][0]
+
+        self.logger.info(
+            f"[VALIDAÇÃO HISTÓRICO] origem={total_origem}, destino={total_destino}, "
+            f"diferença={total_origem - total_destino}"
+        )
+        return total_origem, total_destino
+
+    def valida_historico_bonus_detalhado(self, cliente, data_inicio_historico, data_corte, partner_id=180):
+        """
+        Relatório dia a dia: contagem E soma de bonus_prize/cost, origem x destino.
+        Não levanta exceção -- retorna um DataFrame com as divergências para
+        inspeção manual (diferente de _valida_bloco_bonus, que é fail-fast
+        durante o backfill).
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = datetime.fromisoformat(data_inicio_historico).strftime('%Y-%m-%d')
+        data_fim_str = datetime.fromisoformat(data_corte).strftime('%Y-%m-%d')
+
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        sql_origem = f"""
+        WITH dedup AS (
+            SELECT Id, AwardingTime, BonusPrize, Cost
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+            AND PartnerId = {partner_id}
+            AND toDate(AwardingTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            toDate(AwardingTime) AS dia,
+            COUNT(*) AS qtd,
+            SUM(BonusPrize) AS soma_bonus_prize,
+            SUM(Cost) AS soma_cost
+        FROM dedup
+        GROUP BY dia
+        ORDER BY dia
+        """
+        csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem)
+        df_origem = pd.read_csv(io.BytesIO(csv_origem))
+        df_origem['dia'] = pd.to_datetime(df_origem['dia']).dt.date
+
+        ConnectionDB.conecta(DB, cliente)
+        resultado_destino = ConnectionDB.recupera_dados(
+            'inplay.fact_user_bonus',
+            "awarding_time::date AS dia, COUNT(*) AS qtd, SUM(bonus_prize) AS soma_bonus_prize, SUM(cost) AS soma_cost",
+            f"WHERE partner_id = {partner_id} "
+            f"AND awarding_time >= '{data_ini_str}' AND awarding_time < '{data_fim_str}'::date + 1 GROUP BY awarding_time::date"
+        )
+        df_destino = pd.DataFrame(resultado_destino, columns=['dia', 'qtd', 'soma_bonus_prize', 'soma_cost'])
+
+        comparacao = df_origem.merge(
+            df_destino, on='dia', how='outer', suffixes=('_origem', '_destino')
+        ).fillna(0)
+
+        comparacao['diff_qtd'] = comparacao['qtd_origem'] - comparacao['qtd_destino']
+        comparacao['diff_bonus_prize'] = comparacao['soma_bonus_prize_origem'] - comparacao['soma_bonus_prize_destino']
+        comparacao['diff_cost'] = comparacao['soma_cost_origem'] - comparacao['soma_cost_destino']
+
+        divergencias = comparacao[
+            (comparacao['diff_qtd'] != 0) |
+            (comparacao['diff_bonus_prize'].abs() > 0.01) |
+            (comparacao['diff_cost'].abs() > 0.01)
+        ]
+
+        self.logger.info(
+            f"[VALIDAÇÃO DETALHADA] {len(comparacao)} dias comparados, "
+            f"{len(divergencias)} com divergência"
+        )
+        return comparacao, divergencias
+
+    def processa_bonus_backfill_awarding_nulo(self, cliente, data_inicio_historico, data_corte,
+                                           limite_linhas_por_janela=900000, validar_blocos=True,
+                                           partner_id=None):
+        """
+        Backfill suplementar: captura os ClientBonus com AwardingTime IS NULL,
+        que o backfill principal (processa_bonus_backfill, filtrado por
+        AwardingTime) NUNCA teria capturado -- uma linha com AwardingTime NULL
+        não satisfaz nenhuma condição de intervalo (>=/< sempre avalia UNKNOWN
+        para NULL).
+
+        Achado real (2025): ~9,6M de registros (Status=6, majoritariamente
+        BonusType 12/14/15 -- freebet/freespin/riskfree, que não passam por
+        ativação explícita) mais um resíduo de ~36 registros de outros status,
+        todos com AwardingTime NULL.
+
+        Usa CreationTime (sempre preenchido) para windowing e extração --
+        NÃO usa AwardingTime (é justamente o que falta) nem _peerdb_synced_at
+        (poderia estar concentrado no mesmo timestamp de sync do CDC histórico,
+        mesmo risco de "cargas em lote" já observado no Saldo Diário).
+
+        modo=incremental do dia a dia NÃO precisa de ajuste -- já filtra por
+        _peerdb_synced_at, que cobre esses registros normalmente a partir de
+        quando essa rodada suplementar terminar.
+        """
+        data_atual = datetime.fromisoformat(data_inicio_historico)
+        data_corte_dt = datetime.fromisoformat(data_corte)
+        filtro_extra = "AND AwardingTime IS NULL"
+
+        if partner_id is None:
+            if cliente == 'ZEROUM':
+                partner_id = 180
+            elif cliente == 'ENERGIABET':
+                partner_id = 181
+            else:
+                raise Exception(
+                    "processa_bonus_backfill_awarding_nulo('%s', ...): partner_id "
+                    "não informado e não há default conhecido para esse cliente. "
+                    "Confirme o PartnerId correto e chame novamente com "
+                    "partner_id=<valor confirmado>." % cliente
+                )
+
+        self.logger.info(
+            "[BACKFILL BÔNUS - AwardingTime NULO] Calculando perfil de volume "
+            f"por CreationTime ({data_atual} a {data_corte_dt})..."
+        )
+        perfil = self._perfil_diario_bonus_generico(
+            cliente, data_atual, data_corte_dt,
+            campo_data="CreationTime", filtro_extra=filtro_extra, partner_id=partner_id
+        )
+        janelas_data = self._monta_janelas_por_volume(perfil, limite_linhas_por_janela)
+        janelas = [
+            (datetime.combine(ini, datetime.min.time()),
+            datetime.combine(fim, datetime.min.time()) + timedelta(days=1))
+            for ini, fim in janelas_data
+        ]
+        total_linhas_perfil = sum(t for _, t in perfil)
+        self.logger.info(
+            f"[BACKFILL BÔNUS - AwardingTime NULO] Perfil: {len(perfil)} dias, "
+            f"~{total_linhas_perfil} linhas (antes de dedup), {len(janelas)} janelas"
+        )
+
+        total_blocos_previsto = len(janelas)
+        total_blocos = 0
+        for data_ini_bloco, data_fim_bloco in janelas:
+            total_blocos += 1
+            self.logger.info(
+                f"[BACKFILL BÔNUS - AwardingTime NULO] Bloco {total_blocos}/{total_blocos_previsto}: "
+                f"{data_ini_bloco.strftime('%Y-%m-%d')} -> {data_fim_bloco.strftime('%Y-%m-%d')}"
+            )
+
+            MAX_TENTATIVAS_BLOCO = 3
+            ERROS_TRANSITORIOS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+            for tentativa in range(1, MAX_TENTATIVAS_BLOCO + 1):
+                try:
+                    self.processa_bonus(
+                        cliente,
+                        modo=data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        data_final=data_fim_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        carregar_dimensoes=False,  # dim_bonus/bridge já carregadas
+                        campo_filtro_override="CreationTime",
+                        filtro_extra=filtro_extra,
+                        partner_id=partner_id
+                    )
+                    break
+                except ERROS_TRANSITORIOS as e:
+                    if tentativa >= MAX_TENTATIVAS_BLOCO:
+                        self.logger.error(
+                            f"[BACKFILL BÔNUS - AwardingTime NULO] Bloco "
+                            f"{data_ini_bloco.strftime('%Y-%m-%d')} falhou "
+                            f"{MAX_TENTATIVAS_BLOCO}x. Para retomar, chame "
+                            f"processa_bonus_backfill_awarding_nulo(cliente='{cliente}', "
+                            f"data_inicio_historico='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}', "
+                            f"data_corte='{data_corte}'). Erro: {e}"
+                        )
+                        raise
+                    espera = 30 * tentativa
+                    self.logger.warning(
+                        f"[BACKFILL BÔNUS - AwardingTime NULO] Erro de conexão "
+                        f"(tentativa {tentativa}/{MAX_TENTATIVAS_BLOCO}): {e}. "
+                        f"Tentando de novo em {espera}s..."
+                    )
+                    time.sleep(espera)
+                except Exception as e:
+                    self.logger.error(
+                        f"[BACKFILL BÔNUS - AwardingTime NULO] Falhou no bloco "
+                        f"{data_ini_bloco.strftime('%Y-%m-%d')}. Para retomar, chame "
+                        f"processa_bonus_backfill_awarding_nulo(cliente='{cliente}', "
+                        f"data_inicio_historico='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}', "
+                        f"data_corte='{data_corte}'). Erro: {e}"
+                    )
+                    raise
+
+            if validar_blocos:
+                self._valida_bloco_bonus_awarding_nulo(cliente, data_ini_bloco, data_fim_bloco - timedelta(days=1), partner_id=partner_id)
+
+        self.logger.info(
+            f"[BACKFILL BÔNUS - AwardingTime NULO] Concluído — {total_blocos} blocos, {cliente}"
+        )
+
+    def _valida_bloco_bonus_awarding_nulo(self, cliente, data_inicio_bloco, data_fim_bloco, partner_id=180):
+        """
+        Validação do backfill suplementar -- compara por CreationTime (não
+        AwardingTime, que é NULL nesse universo) com filtro AwardingTime IS NULL
+        dos dois lados.
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = data_inicio_bloco.strftime('%Y-%m-%d')
+        data_fim_str = data_fim_bloco.strftime('%Y-%m-%d')
+
+        # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
+        sql_origem = f"""
+        SELECT COUNT(*) AS total FROM (
+            SELECT Id
+            FROM ClientBonus
+            WHERE _peerdb_is_deleted = 0
+            AND PartnerId = {partner_id}
+            AND toDate(CreationTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+            AND AwardingTime IS NULL
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        """
+        csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem)
+        total_origem = int(pd.read_csv(io.BytesIO(csv_origem))['total'].iloc[0])
+
+        data_fim_exclusivo_str = (data_fim_bloco + timedelta(days=1)).strftime('%Y-%m-%d')
+
+        ConnectionDB.conecta(DB, cliente)
+        resultado_destino = ConnectionDB.recupera_dados(
+            'inplay.fact_user_bonus', 'COUNT(*)',
+            f"WHERE partner_id = {partner_id} "
+            f"AND creation_time >= '{data_ini_str}' AND creation_time < '{data_fim_exclusivo_str}' "
+            f"AND awarding_time IS NULL"
+        )
+        total_destino = resultado_destino[0][0]
+
+        if total_origem != total_destino:
+            self.logger.error(
+                f"[BACKFILL BÔNUS - AwardingTime NULO] VALIDAÇÃO FALHOU no bloco "
+                f"{data_ini_str}-{data_fim_str}: origem={total_origem}, destino={total_destino}"
+            )
+            raise Exception(
+                f"Validação falhou no bloco {data_ini_str}-{data_fim_str}: "
+                f"origem={total_origem} x destino={total_destino}"
+            )
+
+        self.logger.info(
+            f"[BACKFILL BÔNUS - AwardingTime NULO] Bloco {data_ini_str}-{data_fim_str} validado OK "
+            f"({total_origem} linhas)"
+        )

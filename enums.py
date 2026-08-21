@@ -145,3 +145,10 @@ class MetabaseCard(Enum):
     # teste melhoria inclusão de novas colunas na dim_usuario
     #METABASE_CARD_USUARIOS_ZEROUM="card__21517"
     #METABASE_CARD_USUARIOS_ENERGIABET="card__21518"
+
+    ZeroUm_FactUserBonus = "card__21913"
+    #EnergiaBet_FactUserBonus = "card__XXXXX"   # criar ao replicar para Energiabet
+    ZeroUm_Dim_Bonus = "card__21914"
+    #EnergiaBet_Dim_Bonus = "card__XXXXX"   # criar ao replicar para Energiabet
+    ZeroUm_Bridge_Bonus_Product = "card__21915"
+    #EnergiaBet_Bridge_Bonus_Product = "card__XXXXX"   # criar ao replicar para Energiabet

@@ -37,7 +37,13 @@ PROJECT_NAME = 'etl_inplay'
 TABLE_NAME   = 'inplay.etl_execution_logs'
 
 # Clientes que gravam no banco ZEROUM (dlzeroum)
-CLIENTES_ZEROUM = {'ZEROUM', 'ZRO_1_BET', 'ZEROUM_VALIDACAO', 'ZEROUM_SALDO', 'ZEROUM_VALIDA_APOSTA', 'ZEROUM_BACKFILL_USUARIO','ZEROUM_BACKFILL_USUARIO_POR_IDS','ZEROUM_BACKFILL_HISTORICO_PROTECAO' }
+CLIENTES_ZEROUM = {
+    'ZEROUM', 'ZRO_1_BET', 'ZEROUM_VALIDACAO', 'ZEROUM_SALDO', 'ZEROUM_VALIDA_APOSTA',
+    'ZEROUM_BACKFILL_USUARIO', 'ZEROUM_BACKFILL_USUARIO_POR_IDS',
+    'ZEROUM_BACKFILL_HISTORICO_PROTECAO',
+    'ZEROUM_BONUS', 'ZEROUM_BACKFILL_BONUS_AWARDING_NULO',
+    'ZEROUM_PIX',
+}
 
 DDL_CREATE_TABLE = f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -222,7 +228,7 @@ class DBLogger:
             cur.close()
 
             print(f"[DBLogger] {operation} | {cliente_log} | "
-                  f"{status} | {duration}s → {db_name_log}")
+                  f"{status} | {duration}s -> {db_name_log}")
 
         except Exception as e:
             # Nunca levanta exceção — o logger não pode derrubar o ETL

@@ -1,13 +1,20 @@
 .env
 venv/
+.venv/
 
 *.ipynb
 __pycache__/
 *.py[cod]
 *$py.class
-
+*.pyc
 *.xls
 *.xlsx
 *.csv
 
 *.log
+
+.vscode/
+
+# arquivos de teste/scratch
+*test*.py
+*teste*.py

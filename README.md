@@ -10,6 +10,11 @@ O pipeline atende três frentes de clientes:
 - **ENERGIABET** — mesmo fluxo do ZEROUM, base separada.
 - **ZRO_1_BET** — extração direta de PostgreSQL externo (`zro1_bet_adtk`), validação com log de rejeitados e carga incremental/histórica de vendas.
 
+Além do fluxo principal (fact_user_daily e correlatas), dois recursos rodam como cargas **diárias isoladas**, fora do pipeline horário — ver seções **Agregação Pix** e **Bônus** abaixo:
+
+- **Agregação Pix** — resumo de chaves Pix usadas por cliente em saques, consumido via endpoint por um parceiro externo.
+- **Bônus** (`fact_user_bonus`/`dim_bonus`/`bridge_bonus_product` + `agg_bonus_concessoes`) — granular por concessão de bônus, com uma visão agregada por cliente+bônus equivalente em espírito à Agregação Pix.
+
 Em caso de qualquer falha, o pipeline envia alerta por e-mail e grava o resultado da execução na tabela `inplay.etl_execution_logs` no banco correspondente.
 
 
@@ -76,6 +81,7 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 ├── send_email.py                # Envio de e-mail de alerta (padrão DataGuvi)
 ├── db_logger.py                 # Log de execuções ETL no banco (padrão DataGuvi)
 ├── agregacao_dim_usuario.py     # Tabelas físicas de agregação para BI (ZEROUM)
+├── agregacao_bonus.py           # AGG_BONUS_CONCESSOES — agregado incremental de bônus por cliente
 ├── requirements.txt
 ├── .env                         # Credenciais (não versionado)
 ├── .env.example                 # Modelo sem valores reais
@@ -86,13 +92,19 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 
 **`db_logger.py`** — persiste cada execução do ETL na tabela `inplay.etl_execution_logs` (banco determinado pelo cliente: ZEROUM/ZRO_1_BET → `dlzeroum`; ENERGIABET → `dlenergiabet`, via lista explícita `CLIENTES_ZEROUM`). Registra operação, status (`SUCCESS`/`FAILED`), horário de início/fim, duração e motivo do erro. Nunca lança exceção — uma falha no logger não interrompe o ETL.
 
-> ✅ **Corrigido:** `_resolver_banco` decide pelo cliente estar ou não em `CLIENTES_ZEROUM` (um `set` explícito), não por correspondência exata a `'ZEROUM'`. Ao adicionar `ZEROUM_VALIDA_APOSTA`/`ZEROUM_SALDO`/`ZEROUM_VALIDACAO`, os dois modos de backfill (`ZEROUM_BACKFILL_USUARIO`, `ZEROUM_BACKFILL_USUARIO_POR_IDS`) tinham ficado de fora da lista — a checagem inicial de "tabela garantida" ia para `dlenergiabet` por engano (chamadas explícitas de `log_operation(cliente='ZEROUM', ...)` já usavam o banco certo, então o log em si não corrompia, só a mensagem inicial). Os dois foram adicionados a `CLIENTES_ZEROUM`, junto com `ZEROUM_BACKFILL_HISTORICO_PROTECAO` (ver seção **Proteção de Dados Pessoais** abaixo). Os modos `ENERGIABET_*` não precisam de entrada própria: caem no `else` (`dlenergiabet`) corretamente por padrão.
+> ✅ **Corrigido:** `_resolver_banco` decide pelo cliente estar ou não em `CLIENTES_ZEROUM` (um `set` explícito), não por correspondência exata a `'ZEROUM'`. Ao adicionar `ZEROUM_VALIDA_APOSTA`/`ZEROUM_SALDO`/`ZEROUM_VALIDACAO`, os dois modos de backfill (`ZEROUM_BACKFILL_USUARIO`, `ZEROUM_BACKFILL_USUARIO_POR_IDS`) tinham ficado de fora da lista — a checagem inicial de "tabela garantida" ia para `dlenergiabet` por engano (chamadas explícitas de `log_operation(cliente='ZEROUM', ...)` já usavam o banco certo, então o log em si não corrompia, só a mensagem inicial). Os dois foram adicionados a `CLIENTES_ZEROUM`, junto com `ZEROUM_BACKFILL_HISTORICO_PROTECAO` (ver seção **Proteção de Dados Pessoais** abaixo) e, mais recentemente, `ZEROUM_PIX` (mesmo sintoma, ver seção **Agregação Pix**). Os modos `ENERGIABET_*` não precisam de entrada própria: caem no `else` (`dlenergiabet`) corretamente por padrão.
+>
+> ⚠️ **Cuidado com Windows/PowerShell:** o console do Windows usa `cp1252`, que não representa todo caractere Unicode — um `→` num `print()` de confirmação já causou `UnicodeEncodeError` (capturado pelo `except`, gerando uma mensagem de "falha ao registrar log" **enganosa**, mesmo com o `INSERT` já commitado no banco). Corrigido trocando por `->` (ASCII). Ao adicionar novo texto a um `print()` neste arquivo, evitar caracteres fora do cp1252 (setas, emojis) — acentos comuns do português (ã, ç, é etc.) são seguros, fazem parte do cp1252.
 
 **`consume_api.py`** — ⚠️ até esta revisão, `extrai_csv_nativo` chamava `time.sleep(...)` no laço de retry sem que o módulo `time` estivesse importado no arquivo. Isso não quebrava o caminho feliz, mas fazia qualquer retry real (tentativa 1 ou 2 de 3 falhando) estourar `NameError` em vez de tentar de novo — mascarando o erro original e anulando o propósito do retry. Corrigido com `import time` no topo do arquivo.
 
 > 🔒 **Novo:** `principal_zeroum`/`principal_energiabet`/`backfill_dim_usuario`/`backfill_dim_usuario_por_ids` foram alterados para incluir os campos novos de identificação pessoal em `dim_usuario` e parar de descriptografar nome/data de nascimento/celular. Ver seção **Proteção de Dados Pessoais em `dim_usuario`** para detalhes completos (colunas novas, decisão de produto, e dois novos modos de `--cliente` para a carga histórica).
+>
+> 🆕 **Novo:** `processa_agregacao_pix`/`_sql_agregacao_pix` (carga diária isolada de `agg_pix_cliente`) e `processa_bonus`/`processa_bonus_backfill`/`processa_bonus_backfill_awarding_nulo` (carga diária isolada de `fact_user_bonus`/`dim_bonus`/`bridge_bonus_product`, com backfill histórico em dois passos). Ver seções **Agregação Pix** e **Bônus** abaixo para o desenho completo, incluindo um bug real (schema/`PartnerId` fixos em várias queries auxiliares de Bônus) encontrado e corrigido ao ativar para ENERGIABET.
 
 **`agregacao_dim_usuario.py`** — alimenta as tabelas físicas que substituem o processamento pesado das views `vw_dim_usuario` e `vw_fato_usuarios_diario` no Redshift. Executado ao final de cada carga ZEROUM, escopado apenas aos usuários impactados na janela incremental. Não se aplica à Energiabet.
+
+**`agregacao_bonus.py`** — alimenta `inplay.agg_bonus_concessoes` (visão agrupada por `client_id`+`bonus_id`, equivalente em espírito a `agg_pix_cliente`). Chamado de dentro de `processa_bonus()`, logo após o merge de `fact_user_bonus`, recebendo o mesmo DataFrame já extraído — não faz nenhuma extração adicional do Metabase, só recalcula (via `GROUP BY` filtrado) os pares impactados na carga do dia. Uma falha aqui não derruba a carga de `fact_user_bonus`, que já está commitada nesse ponto. Ver seção **Bônus** para detalhes.
 
 
 ## Banco de Dados
@@ -124,6 +136,16 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | `agg_usuario_recorrencia_30d` | Recorrência 30 dias | ZEROUM |
 | `agg_usuario_reativacao` | Estado de reativação | ZEROUM |
 | `etl_execution_logs` | Log de execuções ETL | todos |
+| `agg_pix_cliente` | Chaves Pix por cliente (saques), com soft delete (`is_active`/`deleted_at`) | ZEROUM, ENERGIABET |
+| `fact_user_bonus` | Fato granular de bônus (1 linha por concessão) | ZEROUM, ENERGIABET |
+| `dim_bonus` | Dimensão de configuração de bônus | ZEROUM, ENERGIABET |
+| `bridge_bonus_product` | Ponte bônus × produto elegível | ZEROUM, ENERGIABET |
+| `agg_bonus_concessoes` | Agregado por `client_id`+`bonus_id`, atualização incremental | ZEROUM, ENERGIABET |
+
+> 🆕 **`agg_pix_cliente`, `fact_user_bonus`, `dim_bonus`, `bridge_bonus_product` e
+> `agg_bonus_concessoes` são cargas diárias isoladas**, fora do pipeline horário principal
+> (`principal_zeroum`/`principal_energiabet` não as chamam). Ver seções **Agregação Pix** e
+> **Bônus** abaixo.
 
 > 🔒 **`dim_usuario` ganhou 11 colunas novas** relacionadas à proteção de dados pessoais
 > (`lastname`, `taxnumber`, `documenttype`, `documentnumber`, `documentissuedby`,
@@ -136,7 +158,10 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 `stg_fact_deposits_withdraws_summarized`, `stg_fact_casino_games_hourly`,
 `stg_usuario`, `stg_vendas_data`, `stg_usuarios_impactados`,
 `stg_fact_user_atividade_diaria`, `stg_agg_usuario_metricas`,
-`stg_agg_usuario_reativacao`, `stg_usuario_backfill`
+`stg_agg_usuario_reativacao`, `stg_usuario_backfill`,
+`stg_agregacao_pix_cliente`, `stg_fact_user_bonus`, `stg_dim_bonus`,
+`stg_bridge_bonus_product`, `stg_pares_bonus_impactados`, `stg_agg_bonus_concessoes`,
+`stg_backfill_trigger_ref_bonus` *(só a ferramenta pontual `backfill_trigger_ref_client`)*
 
 **Log/auditoria:**
 `log_vendas_data_rejeitados`, `stg_vendas_data_rejeitados_tmp`,
@@ -149,6 +174,9 @@ Criar `.env` na raiz com as chaves abaixo. O arquivo não deve ser versionado (j
 | `migration_tabelas_fisicas.sql` | `dlzeroum` | Cria tabelas de agregação (ZEROUM) |
 | `migration_etl_execution_logs.sql` | `dlzeroum` **e** `dlenergiabet` | Cria tabela de log de execuções |
 | `alter_dim_usuario_dados_pessoais.sql` | `dlzeroum` **e** `dlenergiabet` | Adiciona as 11 colunas de proteção de dados pessoais em `dim_usuario`/`stg_usuario`, e cria `stg_usuario_backfill` |
+| `migration_agregacao_pix.sql` | `dlzeroum` **e** `dlenergiabet` | Cria `agg_pix_cliente`/`stg_agregacao_pix_cliente` |
+| `migration_energiabet.sql` | `dlenergiabet` | Cria as tabelas de Pix e Bônus (`fact_user_bonus`/`dim_bonus`/`bridge_bonus_product` + stages) — DDL reconciliado com o de produção real de `dlzeroum` |
+| `migration_agg_bonus_concessoes.sql` | `dlzeroum` **e** `dlenergiabet` | Cria `agg_bonus_concessoes`/`stg_pares_bonus_impactados`/`stg_agg_bonus_concessoes` |
 
 > Os scripts de migração não fazem parte do deploy — são executados diretamente no banco antes da ativação.
 
@@ -171,6 +199,15 @@ python main.py --cliente ENERGIABET_VALIDACAO
 
 # Carga manual de CSV auxiliar
 python main.py --cliente sobe_dados
+
+# Agregação Pix (carga diária isolada, incremental por padrão)
+python main.py --cliente ZEROUM_PIX
+python main.py --cliente ENERGIABET_PIX
+
+# Bônus (carga diária isolada, incremental por padrão -- já dispara
+# AGG_BONUS_CONCESSOES automaticamente, não precisa chamar separado)
+python main.py --cliente ZEROUM_BONUS
+python main.py --cliente ENERGIABET_BONUS
 ```
 
 > Para carga histórica do ZRO_1_BET, alterar o parâmetro `modo` para `"historico"` na chamada de `principal_zro_1_bet()` em `consume_api.py`.
@@ -252,6 +289,10 @@ Implementa o padrão DataGuvi. Grava na tabela `inplay.etl_execution_logs` do ba
 | `BACKFILL_DIM_USUARIO_POR_IDS_ENERGIABET` | `dlenergiabet` |
 | `BACKFILL_HISTORICO_PROTECAO_ZEROUM` | `dlzeroum` |
 | `BACKFILL_HISTORICO_PROTECAO_ENERGIABET` | `dlenergiabet` |
+| `ETL_ZEROUM_PIX` | `dlzeroum` |
+| `ETL_ENERGIABET_PIX` | `dlenergiabet` |
+| `ETL_BONUS` (cliente=`ZEROUM`) | `dlzeroum` |
+| `ETL_BONUS` (cliente=`ENERGIABET`) | `dlenergiabet` |
 
 Consultas úteis de monitoramento estão documentadas em `migration_etl_execution_logs.sql`.
 
@@ -330,6 +371,133 @@ pessoais*. Pontos importantes de implementação:
   escrita concorrente. Pode ser reexecutado livremente.
 
 
+## Agregação Pix
+
+Tabela `inplay.agg_pix_cliente` — resumo de chaves Pix usadas por cliente em saques
+(`ClientId`+`PixKey`+`PixType`, com a contagem de transações), consumida via endpoint por
+um **cliente/parceiro externo**. Carga diária isolada, fora do pipeline horário
+(`ZEROUM_PIX`/`ENERGIABET_PIX`).
+
+### Decisão: incremental, não full diário
+
+A origem (`PaymentRequest`, filtrada por `Type=1, Status IN (7,8,12), PixKey IS NOT NULL`)
+tem ~77,5M linhas / ~775K grupos resultantes para o ZEROUM — rodar o `GROUP BY` completo
+todo dia é inviável a médio prazo (tabela transacional, só cresce). O desenho:
+
+- **Backfill (`modo="full"`), uma vez só**: popula a tabela do zero. Obrigatório antes de
+  ativar o incremental (sem ele não há cursor de partida).
+- **Diário (`modo="incremental"`, padrão)**: usa `max(updated_at)` do destino como cursor,
+  filtra a origem por `_peerdb_synced_at` (CDC) desde esse cursor (margem de 4h), identifica
+  os `ClientId` impactados e recalcula do zero o agrupamento completo **só** para esses
+  clientes — não faz delta (`count = count + delta`), porque não há garantia de que um
+  `PaymentRequest` não mude de status depois de atingir 7/8/12 (estorno, reprocessamento).
+
+A origem é `SharedReplacingMergeTree` (CDC) — a query sempre deduplica por `Id`
+(`QUALIFY ROW_NUMBER() ... ORDER BY _peerdb_version DESC) = 1`), mesmo padrão de
+`_sql_saldo_diario`.
+
+### Soft delete, não DELETE físico
+
+Como o parceiro externo faz um pull completo inicial e depois sincroniza incrementalmente
+via `updated_at`, um `DELETE` físico esconderia remoções lógicas dele (uma chave Pix que
+deixa de existir simplesmente sumiria da tabela, sem sinalização). Em vez disso:
+
+- Grupos que deixam de aparecer no recálculo são marcados `is_active = false`,
+  `deleted_at = <timestamp>`, com `updated_at` atualizado **no mesmo `UPDATE`** — é esse
+  campo que carrega o "algo mudou aqui" pro parceiro.
+- Grupos que continuam válidos (ou voltaram a existir) são upsertados de volta com
+  `is_active = true`, `deleted_at = NULL`.
+- Rodar `modo="full"` ocasionalmente (ex.: mensal) funciona como reconciliação de
+  segurança — o soft-delete nesse modo varre a tabela inteira, não só uma janela.
+
+### `PartnerId` por cliente
+
+| Cliente | `PartnerId` (PaymentRequest) | Confirmação |
+|---|---|---|
+| ZEROUM | `180` | Confirmado em produção (mesmo valor já usado em `valida_aposta()`) |
+| ENERGIABET | `181` | Confirmado empiricamente (volume/backfill reais rodaram corretamente) |
+
+`ConsumeAPI.__init__` e `processa_agregacao_pix` resolvem esse valor automaticamente pelo
+`cliente` — não precisa informar `partner_id` manualmente para ZEROUM/ENERGIABET. Para
+qualquer cliente novo, é obrigatório informar `partner_id=<valor confirmado>` explicitamente
+(o método levanta exceção em vez de assumir um default silenciosamente).
+
+
+## Bônus
+
+Três tabelas (`fact_user_bonus`, `dim_bonus`, `bridge_bonus_product`) + uma agregação
+incremental (`agg_bonus_concessoes`, ver `agregacao_bonus.py`). Carga diária isolada
+(`ZEROUM_BONUS`/`ENERGIABET_BONUS`), com `AGG_BONUS_CONCESSOES` disparada automaticamente
+dentro de `processa_bonus()` — não é preciso chamar em separado.
+
+### Achado real: schema/`PartnerId` fixos nas queries (corrigido)
+
+Ao ativar para ENERGIABET, `_sql_fact_user_bonus`, `_sql_dim_bonus`,
+`_sql_bridge_bonus_product`, `_perfil_diario_bonus`, `_perfil_diario_bonus_generico`,
+`_valida_bloco_bonus`, `_valida_bloco_bonus_awarding_nulo` e `_sql_trigger_ref_backfill`
+tinham `partner_zeroum.` fixo no `FROM` e/ou `PartnerId = 180` fixo no `WHERE` — rodar para
+ENERGIABET falhava com `ACCESS_DENIED` (o usuário `readonly_energiabet` do Clickhouse não
+tem grant sobre `partner_zeroum.*`) ou, pior, teria lido dado do parceiro errado
+silenciosamente caso a permissão não bloqueasse. Corrigido em todos os pontos:
+
+- Prefixo de schema removido — a conexão do Metabase (`database`, resolvida por `cliente`)
+  já define a origem certa, mesmo padrão de `_sql_saldo_diario`/`_sql_agregacao_pix`.
+- `PartnerId` parametrizado (`partner_id`) em toda a cadeia de chamadas, incluindo as
+  funções auxiliares de perfil/validação usadas só pelo backfill — esse foi o bug mais
+  sutil: a assinatura já aceitava o parâmetro, mas 3 pontos de chamada diferentes
+  esqueciam de repassar o valor recebido, caindo no default `180` silenciosamente.
+
+`ConsumeAPI.__init__`/`processa_bonus`/`processa_bonus_backfill`/
+`processa_bonus_backfill_awarding_nulo` resolvem `partner_id` automaticamente por
+`cliente` (`180` ZEROUM, `181` ENERGIABET — este último confirmado via script de produção
+real do ambiente Energiabet). Mesma regra do Pix: cliente desconhecido exige `partner_id`
+explícito, sem default silencioso.
+
+### Backfill histórico: dois passos obrigatórios
+
+```bash
+# via python -c (main.py não expõe --modo/--data-corte para backfill de bônus)
+python -c "
+from consume_api import ConsumeAPI
+api = ConsumeAPI.__new__(ConsumeAPI)
+# ... setup real (ver run_bonus_backfill_energiabet.py) ...
+api.processa_bonus_backfill(cliente='ENERGIABET', data_inicio_historico='...', data_corte='...', partner_id=181)
+api.processa_bonus_backfill_awarding_nulo(cliente='ENERGIABET', data_inicio_historico='...', data_corte='...', partner_id=181)
+"
+```
+
+1. **`processa_bonus_backfill`** — carga principal, janelada por volume, filtrada por
+   `AwardingTime`.
+2. **`processa_bonus_backfill_awarding_nulo`** — suplementar, **obrigatória**. Bônus do
+   tipo freebet/freespin/riskfree (`BonusType` 12/14/15) nunca têm `AwardingTime`
+   preenchido — sem esse segundo passo, esses registros ficam de fora do backfill
+   silenciosamente (~9,6M de registros no caso do ZEROUM).
+
+> ⚠️ **Cuidado com `data_corte` = "agora":** o cálculo de janelas trabalha em granularidade
+> de dia inteiro — um `data_corte` no meio do dia de hoje ainda inclui o dia inteiro no
+> bloco final. Como a tabela de origem é viva (bônus sendo concedidos em tempo real), isso
+> pode gerar uma pequena divergência na validação de contagem origem×destino (poucas
+> linhas, tipicamente <10 em ~625K) por escrita concorrente durante o backfill. Fixar
+> `data_corte` num dia seguro no passado (ex.: ontem) evita o problema; o dia excluído fica
+> coberto pela carga incremental normal, que roda logo em seguida.
+
+### `agg_bonus_concessoes` (AGG_BONUS_CONCESSOES)
+
+Visão agrupada por `client_id`+`bonus_id` (qtd de concessões, total concedido, custo,
+rollover pendente etc.), pré-calculada para não exigir `GROUP BY` em tempo real sobre
+`fact_user_bonus` (58M+ linhas) a cada chamada do endpoint. Estratégia: recalcula **só**
+os pares `client_id`+`bonus_id` impactados na carga incremental do dia (via staging +
+`INNER JOIN` filtrado, sem escanear a tabela inteira), e faz `MERGE` (upsert) no destino.
+Não depende do bug de schema/`PartnerId` acima — só opera sobre `fact_user_bonus` já
+carregado no Redshift, nunca volta ao Clickhouse/Metabase.
+
+> Cobre só o que passa pela carga incremental a partir de quando for ativado. O histórico
+> já existente em `fact_user_bonus` precisa de uma carga inicial completa, feita uma única
+> vez, antes de ativar o hook incremental (não implementada neste README — ver com quem
+> ativou o módulo se já existe, ou construir seguindo o mesmo `GROUP BY` de
+> `agregacao_bonus.py`, sem o filtro de pares impactados).
+
+
 ## Fluxo do ETL
 
 ### ZEROUM e ENERGIABET (legado + agregação)
@@ -393,3 +561,20 @@ Grava SUCCESS em etl_execution_logs
 Ao adicionar um novo cliente, seguir o padrão ZRO_1_BET: métodos separados por etapa, try/except com `self.db_logger.log_operation()` + `send_email()` no except, re-raise ao final. O `get_log_history()` já está disponível na classe para compor o body do e-mail.
 
 > Seguindo a correção de e-mails duplicados: se o novo método chamar outros métodos internos da classe (`extrai_csv`, `extrai_csv_nativo`, `extrai_dados_card`, etc.), esses métodos internos não devem enviar e-mail — só o método de orquestração de nível mais alto deve notificar, uma vez por falha.
+
+
+## Testes e Validação (Pix e Bônus)
+
+Scripts auxiliares para validar a integridade de Pix/Bônus/AGG_BONUS_CONCESSOES sem depender só de leitura de log. Do mais barato ao mais completo:
+
+| Script | Toca rede/banco? | O que valida |
+|---|---|---|
+| `test_integridade_etl.py` | Não | Import, wiring (`AGG_BONUS_CONCESSOES` chamado no lugar certo, dispatch de cliente presente), SQL gerada sem schema fixo e com `PartnerId` correto, auditoria de que toda chamada às funções auxiliares de bônus repassa `partner_id` |
+| Import direto (`python -c "from consume_api import ConsumeAPI"`) | Não | Dependência faltando / import circular |
+| `pre_flight_test_energiabet.py` | Só leitura (Metabase) | Autenticação + volume real de Pix/Bônus antes de um backfill grande |
+| `auditoria_integridade_etl.sql` | Só leitura (Redshift) | Volume, soft-delete consistente, PK duplicada, e **reconciliação** de `agg_bonus_concessoes` contra `fact_user_bonus` (recalcula uma amostra na unha e compara) |
+| `run_pix_backfill_energiabet.py` / `run_bonus_backfill_energiabet.py` | Grava dado real | Backfill histórico completo, não-interativo (via `argparse`, sem `input()` — seguro para `Start-Process`/segundo plano no PowerShell) |
+
+Rodar nessa ordem (estático → import → funcional pequeno → banco) cobre a cadeia inteira sem precisar de um backfill completo só para validar uma mudança de código.
+
+>
