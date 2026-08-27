@@ -18,3 +18,5 @@ __pycache__/
 # arquivos de teste/scratch
 *test*.py
 *teste*.py
+
+/analises/

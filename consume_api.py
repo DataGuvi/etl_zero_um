@@ -3870,7 +3870,6 @@ GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
             WHERE _peerdb_is_deleted = 0
             AND PartnerId = {partner_id}
             AND {campo_filtro} >= '{data_inicial.replace("T", " ")}' AND {campo_filtro} < '{data_final.replace("T", " ")}'
-            {filtro_extra}
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY Id
                 ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
@@ -3897,7 +3896,9 @@ GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
             RefClientId        AS ref_client_id,
             _peerdb_synced_at  AS source_updated_at,
             now()              AS import_date
-        FROM bonus_dedup;
+        FROM bonus_dedup
+        WHERE 1=1
+        {filtro_extra};
         """
 
     @staticmethod
@@ -4927,15 +4928,17 @@ GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
         # Sem prefixo de schema -- ver nota em _perfil_diario_bonus.
         sql_origem = f"""
         SELECT COUNT(*) AS total FROM (
-            SELECT Id
-            FROM ClientBonus
-            WHERE _peerdb_is_deleted = 0
-            AND PartnerId = {partner_id}
-            AND toDate(CreationTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
-            AND AwardingTime IS NULL
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY Id ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
-            ) = 1
+            SELECT * FROM (
+                SELECT
+                    Id,
+                    argMax(AwardingTime, _peerdb_version) AS AwardingTime
+                FROM ClientBonus
+                WHERE _peerdb_is_deleted = 0
+                AND PartnerId = {partner_id}
+                AND toDate(CreationTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+                GROUP BY Id
+            )
+            WHERE AwardingTime IS NULL
         )
         """
         csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem)
