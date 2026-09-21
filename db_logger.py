@@ -43,6 +43,9 @@ CLIENTES_ZEROUM = {
     'ZEROUM_BACKFILL_HISTORICO_PROTECAO',
     'ZEROUM_BONUS', 'ZEROUM_BACKFILL_BONUS_AWARDING_NULO',
     'ZEROUM_PIX',
+    # Adicionados nesta conversa (conferência da carga pós-parada de 8+ dias):
+    'ZEROUM_VALIDACAO_PERIODO', 'ZEROUM_REPROCESSA_DIAS_PONTUAIS',
+    'ZEROUM_REPROCESSA_FACT_USER_DAILY',
 }
 
 DDL_CREATE_TABLE = f"""
@@ -187,11 +190,24 @@ class DBLogger:
         """
         Registra o resultado de uma operação ETL.
 
+        ACHADO DESTA CONVERSA: se existir uma marca RUNNING (gravada por
+        log_start(), com o MESMO cliente+operation+start_time — start_time
+        funciona como correlação porque tem precisão de microssegundo,
+        então é praticamente único por execução) esta chamada ATUALIZA
+        essa linha em vez de inserir uma nova — vira 1 linha por execução
+        (RUNNING → SUCCESS/FAILED), não 2 linhas soltas e sem end_time na
+        marca de RUNNING. Se não achar nenhuma linha RUNNING correspondente
+        (uso normal, sem lock — a grande maioria das chamadas no projeto),
+        cai no comportamento de sempre: insere uma linha nova.
+
         Parâmetros
         ----------
         operation    : identificador da operação (ex: 'ETL_ZEROUM')
         status       : 'SUCCESS' ou 'FAILED'
-        start_time   : datetime de início
+        start_time   : datetime de início — se log_start() foi chamado
+                       antes, PRECISA ser o mesmo objeto/valor passado lá,
+                       senão a correlação não bate e uma linha nova é
+                       inserida (a RUNNING fica órfã, como antes).
         end_time     : datetime de fim
         error_reason : mensagem de erro (None em caso de sucesso)
         cliente      : cliente ETL; se None usa o informado no __init__
@@ -214,21 +230,35 @@ class DBLogger:
             )
             conn.autocommit = False
             cur  = conn.cursor()
-            cur.execute(DML_INSERT, (
-                self.project_name,
-                cliente_log,
-                operation,
-                status,
-                error_reason,
-                start_time,
-                end_time,
-                duration,
-            ))
+
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                SET status = %s, error_reason = %s, end_time = %s, duration_seconds = %s
+                WHERE cliente = %s AND operation = %s AND status = 'RUNNING' AND start_time = %s
+                """,
+                (status, error_reason, end_time, duration, cliente_log, operation, start_time)
+            )
+            atualizou = cur.rowcount > 0
+
+            if not atualizou:
+                cur.execute(DML_INSERT, (
+                    self.project_name,
+                    cliente_log,
+                    operation,
+                    status,
+                    error_reason,
+                    start_time,
+                    end_time,
+                    duration,
+                ))
+
             conn.commit()
             cur.close()
 
             print(f"[DBLogger] {operation} | {cliente_log} | "
-                  f"{status} | {duration}s -> {db_name_log}")
+                  f"{status} | {duration}s -> {db_name_log}"
+                  f"{' (linha RUNNING atualizada)' if atualizou else ''}")
 
         except Exception as e:
             # Nunca levanta exceção — o logger não pode derrubar o ETL
@@ -238,3 +268,131 @@ class DBLogger:
                 conn.close()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # LOCK BEST-EFFORT CONTRA EXECUÇÃO CONCORRENTE
+    # ------------------------------------------------------------------
+    # ACHADO DA CONVERSA (conferência da carga ZEROUM, parada de 8+ dias):
+    # os erros "Found multiple matches to update the same tuple" na
+    # recuperação bateram com horários de execução praticamente idênticos
+    # de mais de uma instância do mesmo pipeline (ex.: ETL_ZEROUM) — sinal
+    # de que o cron disparou uma nova rodada antes da anterior (mais lenta
+    # por causa do catch-up) terminar, e as duas disputaram a mesma tabela
+    # de staging.
+    #
+    # LIMITAÇÃO CONHECIDA: isto NÃO é um lock atômico de verdade. O
+    # Redshift não oferece advisory lock, e PRIMARY KEY/UNIQUE são só
+    # dicas para o otimizador, não restrições aplicadas — então não dá
+    # pra usar os mecanismos usuais de lock de banco. O que existe aqui é
+    # um check-then-insert (esta_rodando() consulta, depois log_start()
+    # grava): existe uma janela pequena de corrida entre os dois. Isso
+    # reduz drasticamente a chance de colisão (de "quase garantida",
+    # quando 2 crons disparam com o pipeline anterior ainda rodando, para
+    # "só nesse instante específico de corrida"), mas não elimina 100%.
+    # Suficiente para o cenário real do incidente (rodadas se sobrepondo
+    # por minutos), não para uma race condition de milissegundos.
+
+    def esta_rodando(self, operation: str, cliente: str = None, timeout_minutos: int = 30) -> bool:
+        """
+        Verifica se já existe uma execução da mesma operação+cliente
+        marcada como RUNNING e ainda "fresca" (iniciada há menos de
+        timeout_minutos). Usar como lock best-effort junto com
+        log_start(), no começo do método que se quer proteger:
+
+            if self.db_logger.esta_rodando('ETL_ZEROUM', 'ZEROUM'):
+                self.logger.warning("Já existe uma execução em andamento — abortando.")
+                return
+            self.db_logger.log_start('ETL_ZEROUM', 'ZEROUM')
+
+        timeout_minutos: depois desse tempo, uma marca RUNNING para de
+        travar novas execuções — protege contra um processo que morreu
+        sem nunca gravar SUCCESS/FAILED (ex.: máquina reiniciada no meio
+        do ETL) deixar o lock preso pra sempre. Ajustar conforme a
+        duração normal do pipeline (ETL_ZEROUM historicamente leva
+        alguns minutos; 30 min dá folga confortável sem travar por muito
+        tempo em caso de processo morto).
+        """
+        try:
+            cliente_log = cliente or self.cliente
+            db_name_log = self._resolver_banco(cliente_log)
+            conn = psycopg2.connect(
+                host=DB_HOST, dbname=db_name_log, user=quote_plus(DB_USER),
+                password=DB_PASS, port=DB_PORT
+            )
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FROM {TABLE_NAME}
+                WHERE cliente = %s AND operation = %s AND status = 'RUNNING'
+                  AND start_time > (GETDATE() - INTERVAL '{int(timeout_minutos)} minutes')
+                """,
+                (cliente_log, operation)
+            )
+            (qtd,) = cur.fetchone()
+            cur.close()
+            return qtd > 0
+        except Exception as e:
+            # Se a checagem falhar (ex.: banco fora do ar), não bloqueia o
+            # ETL por causa do lock — melhor rodar com o risco residual de
+            # concorrência do que travar a operação inteira por uma falha
+            # no mecanismo de proteção.
+            print(f"[DBLogger] Falha ao checar lock de '{operation}': {e} — assumindo NÃO travado.")
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def log_start(self, operation: str, cliente: str = None, start_time: datetime = None):
+        """
+        Marca o início de uma operação como RUNNING (end_time/duration =
+        NULL). Usar em conjunto com esta_rodando() — ver docstring acima.
+        Nunca levanta exceção (mesmo princípio de log_operation): falha no
+        lock não pode derrubar o ETL.
+
+        start_time: IMPORTANTE — passe o MESMO objeto datetime que será
+        usado depois na chamada de log_operation() pro mesmo run (ex.: a
+        variável `start_time = datetime.now()` já capturada no começo do
+        método). Se não passar, gera um novo aqui — mas aí ele NÃO vai
+        bater com o start_time que o chamador eventualmente usar em
+        log_operation(), e a correlação RUNNING→SUCCESS/FAILED se perde
+        (log_operation cai no fallback de INSERT, deixando a linha
+        RUNNING órfã, do jeito que era antes desta correção).
+
+        Retorna o start_time efetivamente gravado, para o chamador guardar
+        e reusar exatamente na chamada de log_operation() de encerramento.
+        """
+        if start_time is None:
+            start_time = datetime.now()
+        try:
+            cliente_log = cliente or self.cliente
+            db_name_log = self._resolver_banco(cliente_log)
+            conn = psycopg2.connect(
+                host=DB_HOST, dbname=db_name_log, user=quote_plus(DB_USER),
+                password=DB_PASS, port=DB_PORT
+            )
+            conn.autocommit = False
+            cur = conn.cursor()
+            cur.execute(DML_INSERT, (
+                self.project_name,
+                cliente_log,
+                operation,
+                'RUNNING',
+                None,
+                start_time,
+                None,
+                None,
+            ))
+            conn.commit()
+            cur.close()
+            print(f"[DBLogger] {operation} | {cliente_log} | RUNNING (lock) -> {db_name_log}")
+        except Exception as e:
+            print(f"[DBLogger] Falha ao registrar início (lock) de '{operation}': {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return start_time

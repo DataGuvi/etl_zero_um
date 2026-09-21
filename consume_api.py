@@ -18,6 +18,21 @@ from agregacao_dim_usuario import executar_agregacao_dim_usuario
 from db_logger import DBLogger
 from agregacao_cohort_retencao import executar_agregacao_cohort_retencao, executar_kpi_diario_datatalk
 from agregacao_bonus import executar_agregacao_bonus_concessoes
+from agregacao_fraude_bonus import executar_agregacao_fraude_bonus
+from dispara_alerta_bonus import executar_disparo_alertas_bonus
+
+# CSVs de conferência (validações origem x destino) -- só para uso LOCAL.
+# Em produção a variável não existe (ou é "false") e nenhum arquivo é gravado.
+# Para gerar localmente: EXPORTA_CSV_CONFERENCIA=true no .env da sua máquina.
+# (config.py já chama load_dotenv() ao ser importado acima.)
+EXPORTA_CSV_CONFERENCIA = os.getenv("EXPORTA_CSV_CONFERENCIA", "false").lower() == "true"
+
+
+def salva_csv_conferencia(df, nome_arquivo):
+    """Grava CSV de conferência só se EXPORTA_CSV_CONFERENCIA=true (uso local)."""
+    if EXPORTA_CSV_CONFERENCIA:
+        df.to_csv(nome_arquivo, index=False, encoding="utf-8")
+
 
 class ConsumeAPI:
 
@@ -27,7 +42,7 @@ class ConsumeAPI:
  
    
     def __init__(self, cliente,  modo="incremental", data_final=None, data_inicial_backfill=None, ids_backfill=None,
-                 partner_id=None):
+                 dias_backfill=None, partner_id=None):
         self.engine_zro1bet = self.create_engine_zro1bet()
         self.engine_dw = self.create_engine_dw()
         handler = RotatingFileHandler(
@@ -47,10 +62,69 @@ class ConsumeAPI:
             self.principal_zeroum()
         elif cliente == 'ZEROUM_VALIDACAO':
             self.valida_dados('ZEROUM')
+        elif cliente == 'ZEROUM_VALIDACAO_PERIODO':
+            # Reaproveita --data-inicial-backfill/--data-final como início/fim
+            # do período a validar (mesmo padrão usado nos backfills abaixo),
+            # em vez de reprocessar o histórico inteiro como ZEROUM_VALIDACAO.
+            # 'data_referencia' nos cards de origem é DATE (sem hora), então
+            # aqui o formato esperado é YYYY-MM-DD, não datetime completo.
+            # Ex.: --data-inicial-backfill=2026-09-05 --data-final=2026-09-15
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ZEROUM_VALIDACAO_PERIODO requer --data-inicial-backfill e --data-final "
+                    "(formato YYYY-MM-DD, ex.: 2026-09-05)"
+                )
+            else:
+                self.valida_dados_periodo('ZEROUM', data_inicial_backfill, data_final)
         elif cliente == 'ENERGIABET':
             self.principal_energiabet()
         elif cliente == 'ENERGIABET_VALIDACAO':
             self.valida_dados('ENERGIABET')
+        elif cliente == 'ENERGIABET_VALIDACAO_PERIODO':
+            if not data_inicial_backfill or not data_final:
+                self.logger.error(
+                    "ENERGIABET_VALIDACAO_PERIODO requer --data-inicial-backfill e --data-final "
+                    "(formato YYYY-MM-DD, ex.: 2026-09-05)"
+                )
+            else:
+                self.valida_dados_periodo('ENERGIABET', data_inicial_backfill, data_final)
+        elif cliente == 'ZEROUM_REPROCESSA_DIAS_PONTUAIS':
+            # Usa --dias-backfill (dedicado — NÃO reaproveita --ids-backfill,
+            # que o main.py já converte pra int, incompatível com datas).
+            # Ex.: --dias-backfill=2026-09-05,2026-09-06,2026-09-14
+            if not dias_backfill:
+                self.logger.error(
+                    "ZEROUM_REPROCESSA_DIAS_PONTUAIS requer --dias-backfill com a lista de dias "
+                    "(formato YYYY-MM-DD separados por vírgula, ex.: 2026-09-05,2026-09-06,2026-09-14)"
+                )
+            else:
+                self.reprocessa_dias_pontuais('ZEROUM', dias_backfill)
+        elif cliente == 'ENERGIABET_REPROCESSA_DIAS_PONTUAIS':
+            if not dias_backfill:
+                self.logger.error(
+                    "ENERGIABET_REPROCESSA_DIAS_PONTUAIS requer --dias-backfill com a lista de dias "
+                    "(formato YYYY-MM-DD separados por vírgula, ex.: 2026-09-05,2026-09-06,2026-09-14)"
+                )
+            else:
+                self.reprocessa_dias_pontuais('ENERGIABET', dias_backfill)
+        elif cliente == 'ZEROUM_REPROCESSA_FACT_USER_DAILY':
+            # Reaproveita --dias-backfill. Reprocessa Stage (aposta) e Saque
+            # de fact_user_daily para os dias informados.
+            if not dias_backfill:
+                self.logger.error(
+                    "ZEROUM_REPROCESSA_FACT_USER_DAILY requer --dias-backfill com a lista de dias "
+                    "(formato YYYY-MM-DD separados por vírgula, ex.: 2026-09-05,2026-09-06)"
+                )
+            else:
+                self.reprocessa_fact_user_daily_dias('ZEROUM', dias_backfill)
+        elif cliente == 'ENERGIABET_REPROCESSA_FACT_USER_DAILY':
+            if not dias_backfill:
+                self.logger.error(
+                    "ENERGIABET_REPROCESSA_FACT_USER_DAILY requer --dias-backfill com a lista de dias "
+                    "(formato YYYY-MM-DD separados por vírgula, ex.: 2026-09-05,2026-09-06)"
+                )
+            else:
+                self.reprocessa_fact_user_daily_dias('ENERGIABET', dias_backfill)
         elif cliente == 'sobe_dados':
             self.sobe_dados()
         elif cliente == 'ZRO_1_BET':
@@ -263,6 +337,20 @@ class ConsumeAPI:
     def principal_zeroum(self):
         try:
             start_time = datetime.now()
+            # Lock best-effort contra execução concorrente (ver docstring de
+            # DBLogger.esta_rodando/log_start em db_logger.py — achado desta
+            # conversa: os erros "Found multiple matches to update the same
+            # tuple" na recuperação do incidente batiam com 2+ instâncias de
+            # ETL_ZEROUM rodando ao mesmo tempo, disputando a mesma tabela
+            # de staging).
+            if self.db_logger.esta_rodando('ETL_ZEROUM', 'ZEROUM'):
+                self.logger.warning(
+                    "[LOCK] Já existe uma execução de ETL_ZEROUM em andamento "
+                    "(iniciada há menos de 30 min) — abortando esta execução "
+                    "para evitar concorrência."
+                )
+                return
+            self.db_logger.log_start('ETL_ZEROUM', 'ZEROUM', start_time)
             #data_final = "2026-02-25T00:00:00"
             #while data_final < "2026-03-07T00:00:00":
             #print("atualizando as datas")
@@ -574,6 +662,14 @@ class ConsumeAPI:
     def principal_energiabet(self):
         try:
             start_time = datetime.now()
+            if self.db_logger.esta_rodando('ETL_ENERGIABET', 'ENERGIABET'):
+                self.logger.warning(
+                    "[LOCK] Já existe uma execução de ETL_ENERGIABET em andamento "
+                    "(iniciada há menos de 30 min) — abortando esta execução "
+                    "para evitar concorrência."
+                )
+                return
+            self.db_logger.log_start('ETL_ENERGIABET', 'ENERGIABET', start_time)
             #data_final = "2026-03-25T00:00:00"
             #while data_final < "2026-03-31T00:00:00":
             #print("atualizando as datas")
@@ -1080,6 +1176,17 @@ class ConsumeAPI:
                     f"[extrai_csv] Metabase retornou status {response.status_code} "
                     f"para card {card}. Body (500 chars): {response.text[:500]}"
                 )
+                # ACHADO DESTA CONVERSA: antes disso era só logado e o fluxo
+                # seguia, passando o corpo de erro (JSON) pro pd.read_csv como
+                # se fosse CSV válido — gerava colunas com nome literal tipo
+                # '{"database_id":67' e quebrava mais na frente com um erro de
+                # sintaxe SQL confuso, bem longe da causa real. Agora falha
+                # aqui, na hora, com o motivo real.
+                raise Exception(
+                    f"[extrai_csv] Metabase retornou status {response.status_code} para card {card} "
+                    f"— extração abortada (corpo da resposta não é CSV válido). "
+                    f"Detalhe: {response.text[:500]}"
+                )
             elif len(response.content.strip()) == 0:
                 self.logger.warning(f"[extrai_csv] card={card} retornou corpo vazio")
 
@@ -1096,7 +1203,8 @@ class ConsumeAPI:
             raise
                                                
     def extrai_dados_card(self, auth_id, id_database, id_card, data_inicial, data_final,
-                           campo_filtro="updated_at", tipo_campo="type/DateTime", timeout=2400):
+                           campo_filtro="updated_at", tipo_campo="type/DateTime", timeout=2400,
+                           _profundidade=0):
         try:
             #self.rota = f"https://inplaysoft.metabaseapp.com/api/card/{id}/query/csv"
             #self.header = {
@@ -1142,6 +1250,60 @@ class ConsumeAPI:
                         f"Card {id_card} sem dados no período informado (data_inicial={data_inicial}) "
                         f"— possível ausência de registros novos ou falha na consulta ao Metabase"
                     ) from e
+
+            # ACHADO DESTA CONVERSA: o Metabase corta a exportação de CSV em
+            # LIMITE_LINHAS_METABASE linhas — e até agora só a carga de Saldo
+            # Diário (extrai_dados_card_por_periodo) se protegia disso. Se um
+            # card do pipeline principal chegasse perto/no teto durante uma
+            # janela grande (ex.: catch-up depois de uma parada longa), o
+            # Metabase truncaria silenciosamente, sem gerar erro nenhum.
+            # Replica aqui o mesmo princípio: se bateu perto do teto, divide a
+            # janela de datas ao meio e tenta de novo recursivamente.
+            if data_inicial != 0 and len(df) >= self.LIMITE_LINHAS_METABASE:
+                if _profundidade >= 20:
+                    self.logger.warning(
+                        f"[extrai_dados_card] card={id_card}: profundidade máxima de divisão "
+                        f"atingida (20) e ainda retornou {len(df)} linhas — devolvendo como está, "
+                        f"revisar manualmente."
+                    )
+                    return df
+                try:
+                    limite_inferior = pd.to_datetime(data_inicial)
+                    limite_superior = datetime.now() if data_final == 0 else pd.to_datetime(data_final)
+                except Exception:
+                    self.logger.warning(
+                        f"[extrai_dados_card] card={id_card}: {len(df)} linhas perto do teto do "
+                        f"Metabase, mas não foi possível interpretar data_inicial/data_final "
+                        f"({data_inicial!r}/{data_final!r}) para dividir a janela — devolvendo como está."
+                    )
+                    return df
+                duracao = limite_superior - limite_inferior
+                if duracao <= timedelta(minutes=1):
+                    self.logger.warning(
+                        f"[extrai_dados_card] card={id_card}: janela mínima atingida "
+                        f"({limite_inferior} a {limite_superior}) e ainda assim retornou "
+                        f"{len(df)} linhas — possível truncamento residual, revisar manualmente."
+                    )
+                    return df
+                meio = limite_inferior + duracao / 2
+                meio_str = meio.strftime('%Y-%m-%dT%H:%M:%S')
+                self.logger.warning(
+                    f"[extrai_dados_card] card={id_card}: {len(df)} linhas (perto/no teto de "
+                    f"{self.LIMITE_LINHAS_METABASE} do Metabase) para {data_inicial}–"
+                    f"{data_final or 'agora'}. Dividindo a janela ao meio e tentando de novo."
+                )
+                data_final_primeira_metade = meio_str
+                data_final_segunda_metade = data_final if data_final != 0 else 0
+                df_primeira_metade = self.extrai_dados_card(
+                    auth_id, id_database, id_card, data_inicial, data_final_primeira_metade,
+                    campo_filtro, tipo_campo, timeout, _profundidade + 1
+                )
+                df_segunda_metade = self.extrai_dados_card(
+                    auth_id, id_database, id_card, meio_str, data_final_segunda_metade,
+                    campo_filtro, tipo_campo, timeout, _profundidade + 1
+                )
+                return pd.concat([df_primeira_metade, df_segunda_metade], ignore_index=True)
+
             return df
         except Exception as e:
             self.logger.error(f"Erro ao extrair os dados da consulta {id_card}: {e}")
@@ -1198,10 +1360,12 @@ SELECT
     now() AS data_importacao
 FROM Bet
 WHERE {filtro_base}
+  AND _peerdb_is_deleted = 0
   AND ClientId IN (
       SELECT DISTINCT ClientId
       FROM Bet
       WHERE {filtro_base}
+        AND _peerdb_is_deleted = 0
         AND LastUpdateTime > '{data_inicial}'
   )
 GROUP BY ClientId
@@ -1258,6 +1422,23 @@ WITH cliente_ajustado AS (
     SELECT DISTINCT ON (c.Id) c.*
     FROM Client c
     ORDER BY c.Id, c.LastSessionId DESC
+),
+bet_dedup AS (
+    SELECT
+        Id,
+        argMax(ClientId, _peerdb_version) AS bet_client_id,
+        argMax(BetAmount, _peerdb_version) AS BetAmount,
+        argMax(WinAmount, _peerdb_version) AS WinAmount,
+        argMax(BetBonusAmount, _peerdb_version) AS BetBonusAmount,
+        argMax(Ggr, _peerdb_version) AS Ggr,
+        argMax(State, _peerdb_version) AS State,
+        argMax(ProductId, _peerdb_version) AS ProductId
+    FROM Bet
+    WHERE _peerdb_is_deleted = 0
+      AND ClientId IN (
+          SELECT Id FROM cliente_ajustado WHERE LastUpdateTime > '{data_inicial}'
+      )
+    GROUP BY Id
 )
 SELECT
     c.Id AS id,
@@ -1270,12 +1451,9 @@ SELECT
     round(sum(b.Ggr), 2) AS total_ggr,
     max(c.LastUpdateTime) AS updated_at,
     min(c.CreationTime)::DATE AS data_referencia
-FROM Bet b
-INNER JOIN cliente_ajustado c ON b.ClientId = c.Id
+FROM bet_dedup b
+INNER JOIN cliente_ajustado c ON b.bet_client_id = c.Id
 WHERE b.State NOT IN (1, 4) AND b.ProductId != 6
-  AND c.Id IN (
-      SELECT Id FROM cliente_ajustado WHERE LastUpdateTime > '{data_inicial}'
-  )
 GROUP BY c.Id
 """
 
@@ -1283,36 +1461,108 @@ GROUP BY c.Id
     def _sql_usuario_totalizador_bet_por_ids(ids: list) -> str:
         """
         Variante de _sql_usuario_totalizador_bet para regularização pontual
-        de registros específicos: filtra cliente_ajustado por uma lista de
-        Id (tipicamente pequena), em vez de uma janela de LastUpdateTime.
-        Evita o full scan de Bet do mesmo jeito — o filtro entra ANTES do
-        JOIN, restringindo cliente_ajustado (vindo de Client, pequeno) antes
-        de tocar em Bet (grande).
+        de registros específicos.
+
+        Filtra a tabela Bet pelos ClientId desejados antes da deduplicação
+        por Id/_peerdb_version, evitando processar a Bet inteira.
         """
+
         ids_sql = ", ".join(str(int(i)) for i in ids)
+
         return f"""
-WITH cliente_ajustado AS (
-    SELECT DISTINCT ON (c.Id) c.*
-    FROM Client c
-    WHERE c.Id IN ({ids_sql})
-    ORDER BY c.Id, c.LastSessionId DESC
-)
-SELECT
-    c.Id AS id,
-    sum(CASE WHEN b.BetAmount > 0 THEN 1 ELSE 0 END) AS total_quantity_bet,
-    round(sum(b.BetAmount), 2) AS total_amount_bet,
-    sum(CASE WHEN b.WinAmount > 0 THEN 1 ELSE 0 END) AS total_quantity_win,
-    round(sum(b.WinAmount), 2) AS total_amount_win,
-    sum(CASE WHEN b.BetBonusAmount > 0 THEN 1 ELSE 0 END) AS total_quantity_bonus,
-    round(sum(b.BetBonusAmount), 2) AS total_amount_bonus,
-    round(sum(b.Ggr), 2) AS total_ggr,
-    max(c.LastUpdateTime) AS updated_at,
-    min(c.CreationTime)::DATE AS data_referencia
-FROM Bet b
-INNER JOIN cliente_ajustado c ON b.ClientId = c.Id
-WHERE b.State NOT IN (1, 4) AND b.ProductId != 6
-GROUP BY c.Id
-"""
+    WITH cliente_ajustado AS (
+
+        SELECT DISTINCT ON (c.Id) c.*
+        FROM Client c
+        WHERE c.Id IN ({ids_sql})
+        ORDER BY c.Id, c.LastSessionId DESC
+
+    ),
+
+    bet_filtrado AS (
+
+        SELECT
+            Id,
+            ClientId,
+            BetAmount,
+            WinAmount,
+            BetBonusAmount,
+            Ggr,
+            State,
+            ProductId,
+            _peerdb_version,
+            _peerdb_is_deleted
+        FROM Bet
+        WHERE
+            _peerdb_is_deleted = 0
+            AND ClientId IN ({ids_sql})
+
+    ),
+
+    bet_dedup AS (
+
+        SELECT
+            Id,
+            argMax(ClientId, _peerdb_version) AS bet_client_id,
+            argMax(BetAmount, _peerdb_version) AS BetAmount,
+            argMax(WinAmount, _peerdb_version) AS WinAmount,
+            argMax(BetBonusAmount, _peerdb_version) AS BetBonusAmount,
+            argMax(Ggr, _peerdb_version) AS Ggr,
+            argMax(State, _peerdb_version) AS State,
+            argMax(ProductId, _peerdb_version) AS ProductId
+        FROM bet_filtrado
+        GROUP BY Id
+
+    )
+
+    SELECT
+
+        c.Id AS id,
+
+        sum(
+            CASE
+                WHEN b.BetAmount > 0 THEN 1
+                ELSE 0
+            END
+        ) AS total_quantity_bet,
+
+        round(sum(b.BetAmount), 2) AS total_amount_bet,
+
+        sum(
+            CASE
+                WHEN b.WinAmount > 0 THEN 1
+                ELSE 0
+            END
+        ) AS total_quantity_win,
+
+        round(sum(b.WinAmount), 2) AS total_amount_win,
+
+        sum(
+            CASE
+                WHEN b.BetBonusAmount > 0 THEN 1
+                ELSE 0
+            END
+        ) AS total_quantity_bonus,
+
+        round(sum(b.BetBonusAmount), 2) AS total_amount_bonus,
+
+        round(sum(b.Ggr), 2) AS total_ggr,
+
+        max(c.LastUpdateTime) AS updated_at,
+
+        toDate(min(c.CreationTime)) AS data_referencia
+
+    FROM bet_dedup b
+
+    INNER JOIN cliente_ajustado c
+        ON b.bet_client_id = c.Id
+
+    WHERE
+        b.State NOT IN (1, 4)
+        AND b.ProductId != 6
+
+    GROUP BY c.Id
+    """
 
     def extrai_usuario_totalizador_bet_nativo(self, auth_id, id_database, data_inicial):
         """
@@ -1338,6 +1588,13 @@ GROUP BY c.Id
         extrai_usuario_totalizador_bet_nativo, mas filtrando por uma lista
         de ids em vez de uma janela de tempo.
         """
+
+        self.logger.info(
+            f"[DEBUG BET] Quantidade de IDs no lote: {len(ids)}"
+        )
+        self.logger.info(
+            f"[DEBUG BET] Primeiros IDs: {ids[:10]}"
+        )
         self.logger.info(f"Extraindo totalizador bet de usuário para {len(ids)} ids específicos (query nativa)")
         sql = self._sql_usuario_totalizador_bet_por_ids(ids)
         csv = self.extrai_csv_nativo(auth_id, id_database, sql, timeout=900)
@@ -1346,40 +1603,47 @@ GROUP BY c.Id
 
     @staticmethod
     def _sql_apostas_jogos_hora(data_inicial: str, partner_id: int) -> str:
-        """
-        Monta a query nativa de apostas por jogo/hora (substitui o card
-        ZeroUm_ApostasJogosHora / EnergiaBet_ApostasJogosHora).
-
-        Diferente da aposta (primeira/última) e do totalizador bet: aqui
-        NÃO há risco de mudar a semântica ao filtrar antes do GROUP BY.
-        O agrupamento (reference, ProductId, data) já deriva do próprio
-        LastUpdateTime que seria usado pra filtrar — cada linha pertence a
-        exatamente um grupo definido por esse mesmo campo. Filtrar antes ou
-        depois do GROUP BY dá o mesmo resultado; a diferença é só quantas
-        linhas de Bet o ClickHouse precisa escanear pra chegar lá (query
-        original não tinha NENHUM filtro de tempo — reagregava toda a
-        tabela Bet a cada chamada).
-        """
+        # PRECAUÇÃO (ver conversa): mesmo padrão estrutural que já confirmou
+        # o bug "ILLEGAL_AGGREGATION" em _sql_usuario_totalizador_bet —
+        # agregado com o MESMO nome da coluna original (ProductId AS
+        # ProductId), usado depois num JOIN por fora (INNER JOIN Product p
+        # ON p.Id = b.ProductId). Renomeado para bet_product_id como
+        # precaução, mesmo sem confirmação direta de falha aqui (é uma
+        # subquery FROM (...), não uma CTE WITH — o bug pode ou não se
+        # manifestar do mesmo jeito, mas o padrão de risco é idêntico).
         return f"""
-SELECT
-    toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE AS data_referencia,
-    formatDateTime(toStartOfHour(toTimeZone(toDateTime(LastUpdateTime, 'UTC'), 'America/Sao_Paulo')),'%Y-%m-%d %H:%i:%S') AS reference,
-    b.ProductId AS game_id,
-    sum(CASE WHEN b.BonusId IS NOT NULL THEN 1 ELSE 0 END) AS with_bonus,
-    round(sum(b.BetAmount),2) AS bet_amount,
-    round(sum(b.WinAmount),2) AS win_amount,
-    sum(CASE WHEN b.BetAmount > 0 THEN 1 ELSE 0 END) AS bet_qty,
-    sum(CASE WHEN b.WinAmount > 0 THEN 1 ELSE 0 END) AS win_qty,
-    round(sum(ifNull(b.BetAmount, 0) - ifNull(b.WinAmount, 0)), 2) AS ggr_amount,
-    max(toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')) AS updated_at,
-    now() AS data_importacao
-FROM Bet b
-INNER JOIN Product p ON p.Id = b.ProductId
-WHERE b.State NOT IN (1, 4) AND b.ProductId != 6 AND b.PartnerId = {partner_id}
-  AND b.LastUpdateTime > '{data_inicial}'
-GROUP BY b.ProductId, reference, toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE
-ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
-"""
+    SELECT
+        toTimeZone(b.LastUpdateTimeMax, 'America/Sao_Paulo')::DATE AS data_referencia,
+        formatDateTime(toStartOfHour(toTimeZone(toDateTime(LastUpdateTimeMax, 'UTC'), 'America/Sao_Paulo')),'%Y-%m-%d %H:%i:%S') AS reference,
+        b.bet_product_id AS game_id,
+        sum(CASE WHEN b.BonusId IS NOT NULL THEN 1 ELSE 0 END) AS with_bonus,
+        round(sum(b.BetAmount),2) AS bet_amount,
+        round(sum(b.WinAmount),2) AS win_amount,
+        sum(CASE WHEN b.BetAmount > 0 THEN 1 ELSE 0 END) AS bet_qty,
+        sum(CASE WHEN b.WinAmount > 0 THEN 1 ELSE 0 END) AS win_qty,
+        round(sum(ifNull(b.BetAmount, 0) - ifNull(b.WinAmount, 0)), 2) AS ggr_amount,
+        max(toTimeZone(b.LastUpdateTimeMax, 'America/Sao_Paulo')) AS updated_at,
+        now() AS data_importacao
+    FROM (
+        SELECT
+            Id,
+            argMax(BetAmount, _peerdb_version) AS BetAmount,
+            argMax(WinAmount, _peerdb_version) AS WinAmount,
+            argMax(BonusId, _peerdb_version) AS BonusId,
+            argMax(State, _peerdb_version) AS State,
+            argMax(ProductId, _peerdb_version) AS bet_product_id,
+            argMax(PartnerId, _peerdb_version) AS PartnerId,
+            argMax(LastUpdateTime, _peerdb_version) AS LastUpdateTimeMax
+        FROM Bet
+        WHERE _peerdb_is_deleted = 0
+        AND LastUpdateTime > '{data_inicial}'
+        GROUP BY Id
+    ) b
+    INNER JOIN Product p ON p.Id = b.bet_product_id
+    WHERE b.State NOT IN (1, 4) AND b.bet_product_id != 6 AND b.PartnerId = {partner_id}
+    GROUP BY b.bet_product_id, reference, toTimeZone(b.LastUpdateTimeMax, 'America/Sao_Paulo')::DATE
+    ORDER BY toTimeZone(b.LastUpdateTimeMax, 'America/Sao_Paulo')::DATE DESC
+    """
 
     def extrai_apostas_jogos_hora_nativo(self, auth_id, id_database, partner_id, data_inicial):
         """
@@ -1994,7 +2258,7 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
             df_usuario_origem = self.extrai_dados_card(auth_id, database, card, 0, 0)
 
             nome_arquivo = f"usuario_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df_usuario_origem.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            salva_csv_conferencia(df_usuario_origem, nome_arquivo)
 
             df_validacao = df_apostas_dia_origem.merge(df_deposito_saque_origem[['data_referencia', 'deposit_amount_origem', 'deposit_qtd_origem', 'withdraw_amount_origem', 'withdraw_qtd_origem']], 
                                         on=['data_referencia'],
@@ -2118,7 +2382,7 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
                                                         'certo')
 
             nome_arquivo = f"validacao2_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-            df_validacao.to_csv(nome_arquivo, index=False, encoding="utf-8")
+            salva_csv_conferencia(df_validacao, nome_arquivo)
                 
             ConnectionDB.conecta(DB, cliente)
             ConnectionDB.insere_dados_bulk(tabela_validacao, df_validacao, self.logger)
@@ -2146,6 +2410,463 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
                 f"=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
             )
             send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na Validação", body=b)
+            raise
+
+    def valida_dados_periodo(self, cliente: str, data_inicio: str, data_fim: str,
+                              campo_filtro_origem: str = "data_referencia",
+                              tipo_campo_origem: str = "type/Date"):
+        """
+        Mesma comparação origem x destino de valida_dados(), mas restrita a
+        um período [data_inicio, data_fim), em vez de recalcular o
+        histórico inteiro a cada execução.
+
+        Criada para apurações pontuais (ex.: conferência de um intervalo
+        específico após um incidente) sem precisar reprocessar/sobrescrever
+        a tabela de validação inteira, nem reextrair o histórico completo
+        da origem, só pra checar alguns dias.
+
+        data_inicio / data_fim: string de data, ex. '2026-09-05' e
+        '2026-09-15' — sem hora, porque 'data_referencia' nos cards de
+        origem é um campo DATE (confirmado: é o resultado de
+        toTimeZone(..., 'America/Sao_Paulo')::DATE em cima de um campo
+        *LastUpdateTime, truncado pra dia — não tem componente de hora).
+
+        campo_filtro_origem: campo usado para filtrar os 3 cards de
+        validação na origem — default 'data_referencia' (a data que o
+        card representa), e não 'updated_at' (quando o registro foi
+        tocado por último), porque aqui queremos os DIAS do período, não
+        os registros modificados no período.
+
+        tipo_campo_origem: base-type passado ao filtro do Metabase —
+        default 'type/Date' (não 'type/DateTime', que é o padrão de
+        extrai_dados_card) exatamente porque 'data_referencia' é DATE.
+        Se algum dia campo_filtro_origem for trocado para um campo
+        datetime (ex.: 'updated_at'), ajuste também este parâmetro para
+        'type/DateTime'.
+        """
+        start_time = datetime.now()
+        try:
+            self.logger.info(
+                f"Iniciando validação por período ({data_inicio} a {data_fim}) para {cliente}"
+            )
+            database = MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM' else MetabaseDatabase.ClickhousePartnerEnergiabet.value
+            auth_id = self.conection(cliente)
+
+            card = MetabaseCard.ZeroUm_Validacao_ApostasDia.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_ApostasDia.value
+            df_apostas_dia_origem = self.extrai_dados_card(
+                auth_id, database, card, data_inicio, data_fim,
+                campo_filtro=campo_filtro_origem, tipo_campo=tipo_campo_origem
+            )
+
+            card = MetabaseCard.ZeroUm_Validacao_DepositoSaque.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_DepositoSaque.value
+            df_deposito_saque_origem = self.extrai_dados_card(
+                auth_id, database, card, data_inicio, data_fim,
+                campo_filtro=campo_filtro_origem, tipo_campo=tipo_campo_origem
+            )
+
+            card = MetabaseCard.ZeroUm_Validacao_RegistroUsuario.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Validacao_RegistroUsuario.value
+            df_usuario_origem = self.extrai_dados_card(
+                auth_id, database, card, data_inicio, data_fim,
+                campo_filtro=campo_filtro_origem, tipo_campo=tipo_campo_origem
+            )
+
+            # 'outer' (não 'left') para não perder dias que tenham
+            # depósito/saque ou cadastro, mas nenhuma aposta no período.
+            df_validacao = df_apostas_dia_origem.merge(
+                df_deposito_saque_origem[['data_referencia', 'deposit_amount_origem', 'deposit_qtd_origem',
+                                           'withdraw_amount_origem', 'withdraw_qtd_origem']],
+                on=['data_referencia'], how='outer'
+            )
+            df_validacao = df_validacao.merge(
+                df_usuario_origem[['data_referencia', 'users_registered_origem']],
+                on=['data_referencia'], how='outer'
+            )
+
+            script = f"""
+                        with
+                        deposits_withdraw_summarized as (
+                            select 
+                                f.date,
+                                sum(case when f.tipo = 'deposit' then f.amount else 0 end)  as deposit_amount_destino_summarized,
+                                sum(case when f.tipo = 'deposit' then f.qtd else 0 end)  as deposit_qtd_destino_summarized,
+                                sum(case when f.tipo = 'withdraw' then f.amount else 0 end)  as withdraw_amount_destino_summarized,
+                                sum(case when f.tipo = 'withdraw' then f.qtd else 0 end)  as withdraw_qtd_destino_summarized
+                            from inplay.fact_deposits_withdraws_summarized f
+                            where f.date::date BETWEEN '{data_inicio}'::date AND '{data_fim}'::date
+                            group by f.date
+                        ),
+                        user_daily as (
+                            select 
+                                f.data_referencia ,
+                                sum(f.deposit_amount) as deposit_amount_destino_user_daily,
+                                sum(f.deposit_quantity) as deposit_qtd_destino_user_daily,
+                                sum(f.withdraw_amount) as withdraw_amount_destino_user_daily,
+                                sum(f.withdraw_quantity) as withdraw_qtd_destino_user_daily,
+                                sum(f.cassino_bet_amount) as bet_amount_destino_user_daily,
+                                sum(f.cassino_bet_quantity) as bet_qtd_destino_user_daily
+                            from inplay.fact_user_daily f
+                            where f.data_referencia::date BETWEEN '{data_inicio}'::date AND '{data_fim}'::date
+                            group by f.data_referencia
+                        ),
+                        casino_games as (
+                            select 
+                                f.reference::date,
+                                sum(f.bet_amount) as bet_amount_destino_casino_games,
+                                sum(f.bet_qty) as bet_qtd_destino_casino_games
+                            from inplay.fact_casino_games_hourly f
+                            where f.reference::date BETWEEN '{data_inicio}'::date AND '{data_fim}'::date
+                            group by reference::date 
+                        ),
+                        users_registration as (
+                            select 
+                                d.registration_date::date,
+                                count(1) as users_registered_destino_dim_usuario
+                            from inplay.dim_usuario d
+                            where d.registration_date::date BETWEEN '{data_inicio}'::date AND '{data_fim}'::date
+                            group by d.registration_date::date
+                        )
+                        select
+                            coalesce(s.date, ud.data_referencia, cg.reference, ur.registration_date) as data_referencia,
+                            s.deposit_amount_destino_summarized,
+                            ud.deposit_amount_destino_user_daily,
+                            s.deposit_qtd_destino_summarized,
+                            ud.deposit_qtd_destino_user_daily,
+                            s.withdraw_amount_destino_summarized,
+                            ud.withdraw_amount_destino_user_daily,
+                            s.withdraw_qtd_destino_summarized,
+                            ud.withdraw_qtd_destino_user_daily,
+                            cg.bet_amount_destino_casino_games,
+                            ud.bet_amount_destino_user_daily,
+                            cg.bet_qtd_destino_casino_games,
+                            ud.bet_qtd_destino_user_daily,
+                            ur.users_registered_destino_dim_usuario,
+                            timezone('America/Sao_Paulo', current_timestamp) as import_date
+                        from deposits_withdraw_summarized s
+                            full outer join user_daily ud on s.date = ud.data_referencia
+                            full outer join casino_games cg on coalesce(s.date, ud.data_referencia) = cg.reference
+                            full outer join users_registration ur on coalesce(s.date, ud.data_referencia, cg.reference) = ur.registration_date
+                        order by 1 desc;
+                    """
+
+            tabela_validacao = 'inplay.verificacao_zero_um' if cliente == 'ZEROUM' else 'inplay.verificacao_energia_bet'
+            ConnectionDB.conecta(DB, cliente)
+            df_dados_destino = ConnectionDB.executa_script(script, self.logger)
+
+            df_validacao['data_referencia'] = pd.to_datetime(df_validacao['data_referencia'])
+            df_dados_destino['data_referencia'] = pd.to_datetime(df_dados_destino['data_referencia'])
+
+            df_validacao = df_validacao.merge(
+                df_dados_destino[['data_referencia', 'deposit_amount_destino_summarized', 'deposit_amount_destino_user_daily',
+                                   'deposit_qtd_destino_summarized', 'deposit_qtd_destino_user_daily',
+                                   'withdraw_amount_destino_summarized', 'withdraw_amount_destino_user_daily',
+                                   'withdraw_qtd_destino_summarized', 'withdraw_qtd_destino_user_daily',
+                                   'bet_amount_destino_casino_games', 'bet_amount_destino_user_daily',
+                                   'bet_qtd_destino_casino_games', 'bet_qtd_destino_user_daily',
+                                   'users_registered_destino_dim_usuario', 'import_date']],
+                on=['data_referencia'], how='outer'
+            )
+
+            df_validacao = df_validacao.rename(columns={'data_referencia': 'data'})
+            df_validacao = df_validacao.replace({np.nan: None})
+
+            df_validacao['deposit_validacao'] = np.where(
+                ((df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_summarized']) |
+                 (df_validacao['deposit_amount_origem'] != df_validacao['deposit_amount_destino_user_daily']) |
+                 (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_summarized']) |
+                 (df_validacao['deposit_qtd_origem'] != df_validacao['deposit_qtd_destino_user_daily'])),
+                'errado', 'certo'
+            )
+            df_validacao['withdraw_validacao'] = np.where(
+                ((df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_summarized']) |
+                 (df_validacao['withdraw_amount_origem'] != df_validacao['withdraw_amount_destino_user_daily']) |
+                 (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_summarized']) |
+                 (df_validacao['withdraw_qtd_origem'] != df_validacao['withdraw_qtd_destino_user_daily'])),
+                'errado', 'certo'
+            )
+            df_validacao['bet_validacao'] = np.where(
+                ((df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_casino_games']) |
+                 (df_validacao['bet_amount_origem'] != df_validacao['bet_amount_destino_user_daily']) |
+                 (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_casino_games']) |
+                 (df_validacao['bet_qtd_origem'] != df_validacao['bet_qtd_destino_user_daily'])),
+                'errado', 'certo'
+            )
+            df_validacao['users_registered_validacao'] = np.where(
+                (df_validacao['users_registered_origem'] != df_validacao['users_registered_destino_dim_usuario']),
+                'errado', 'certo'
+            )
+
+            # Apaga e recarrega SÓ o recorte de datas pedido — preserva o
+            # restante da tabela (valida_dados() apaga tudo, esta não).
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados(
+                tabela_validacao,
+                f"WHERE data BETWEEN '{data_inicio}' AND '{data_fim}'",
+                self.logger
+            )
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.insere_dados_bulk(tabela_validacao, df_validacao, self.logger)
+
+            self.db_logger.log_operation(
+                operation=f'VALIDACAO_{cliente}_PERIODO',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+            return df_validacao
+
+        except Exception as e:
+            self.logger.error(
+                f"Erro na validação por período para {cliente} ({data_inicio} a {data_fim}): {e}"
+            )
+            self.db_logger.log_operation(
+                operation=f'VALIDACAO_{cliente}_PERIODO',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            raise
+
+    def reprocessa_dias_pontuais(self, cliente: str, dias: list):
+        """
+        Reprocessa pontualmente inplay.fact_casino_games_hourly e
+        inplay.fact_deposits_withdraws_summarized para uma lista de dias
+        específicos — sem rodar principal_zeroum()/principal_energiabet()
+        inteiro de novo.
+
+        Criada pro incidente da parada de 8+ dias (ver conversa):
+        valida_dados_periodo() apontou que só alguns dias pontuais
+        ficaram com dado incompleto nessas duas tabelas especificamente
+        (ex.: 2026-09-05, 2026-09-06, 2026-09-14) — as demais
+        tabelas/dias do período já estavam corretos, então não faz
+        sentido reprocessar tudo de novo.
+
+        dias: lista de strings 'YYYY-MM-DD', ex.:
+              ['2026-09-05', '2026-09-06', '2026-09-14']
+
+        Estratégia importante: filtra a origem DIRETO pelo campo de data
+        do próprio registro ('reference' / 'date'), e não por
+        'updated_at' como o pipeline principal faz. Isso é proposital —
+        o dado que falta é antigo, o updated_at dele já passou e não
+        reaparece num filtro incremental por updated_at. Só filtrando
+        pela data do evento em si é que a origem devolve essas linhas de
+        novo. O merge no destino é um upsert (por chave), então rodar
+        esta função mais de uma vez para o mesmo dia é seguro — não
+        duplica nada.
+        """
+        start_time = datetime.now()
+        try:
+            database = MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM' else MetabaseDatabase.ClickhousePartnerEnergiabet.value
+            card_apostas_jogos_hora = MetabaseCard.ZeroUm_ApostasJogosHora.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_ApostasJogosHora.value
+            card_dep_saq_dias = MetabaseCard.ZeroUm_DepositoSaqueDias.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_DepositoSaqueDias.value
+            auth_id = self.conection(cliente)
+
+            for dia in dias:
+                dia_dt = datetime.strptime(dia, '%Y-%m-%d')
+                dia_seguinte = (dia_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+
+                self.logger.info(f"[reprocessa_dias_pontuais] {cliente} — reprocessando {dia}")
+
+                # --- fact_casino_games_hourly ---
+                # janela [dia 00:00, dia+1 00:00) filtrando por 'reference'.
+                # ATENÇÃO: no card ZeroUm_ApostasJogosHora (14785), 'reference'
+                # é gerado com formatDateTime(...) no ClickHouse — ou seja, é
+                # TEXTO ('YYYY-MM-DD HH:MM:SS'), não um DateTime nativo (isso é
+                # diferente de 'updated_at', que É um DateTime de verdade — por
+                # isso o pipeline principal, que filtra por updated_at, nunca
+                # esbarrou nisso). Por ser texto, o filtro tem que usar
+                # tipo_campo="type/Text" e o valor tem que estar EXATAMENTE no
+                # mesmo formato da coluna (espaço, não "T", entre data e hora —
+                # comparação de string é sensível a isso).
+                data_inicio_ref = f"{dia} 00:00:00"
+                data_fim_ref = f"{dia_seguinte} 00:00:00"
+                df_cassino = self.extrai_dados_card(
+                    auth_id, database, card_apostas_jogos_hora,
+                    data_inicio_ref, data_fim_ref,
+                    campo_filtro="reference", tipo_campo="type/Text"
+                )
+                colunas_esperadas_cassino = ['reference', 'game_id', 'with_bonus', 'bet_amount', 'win_amount',
+                                              'bet_qty', 'win_qty', 'ggr_amount', 'updated_at', 'data_importacao']
+                faltando = [c for c in colunas_esperadas_cassino if c not in df_cassino.columns]
+                if faltando:
+                    raise Exception(
+                        f"[reprocessa_dias_pontuais] card ApostasJogosHora ({dia}) não trouxe as colunas "
+                        f"esperadas {faltando} — provável erro do Metabase/ClickHouse na extração "
+                        f"(ver log de [extrai_csv]/[extrai_dados_card] logo acima). "
+                        f"Colunas recebidas: {list(df_cassino.columns)[:10]}..."
+                    )
+                df_cassino_ajust = df_cassino[colunas_esperadas_cassino]
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.deleta_dados('inplay.stg_fact_casino_games_hourly', "", self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_fact_casino_games_hourly', df_cassino_ajust, self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.mergeia_dados(
+                    'inplay.stg_fact_casino_games_hourly', 'inplay.fact_casino_games_hourly',
+                    df_cassino_ajust, ['reference', 'game_id'], self.logger
+                )
+
+                # --- fact_deposits_withdraws_summarized ---
+                # 'date' é campo DATE nativo (::DATE no ClickHouse), diferente
+                # de 'reference' acima — type/Date continua correto aqui.
+                df_dep_saq = self.extrai_dados_card(
+                    auth_id, database, card_dep_saq_dias,
+                    dia, dia,
+                    campo_filtro="date", tipo_campo="type/Date"
+                )
+                colunas_esperadas_dep_saq = ['date', 'hora', 'tipo', 'qtd', 'amount', 'updated_at', 'import_date']
+                faltando = [c for c in colunas_esperadas_dep_saq if c not in df_dep_saq.columns]
+                if faltando:
+                    raise Exception(
+                        f"[reprocessa_dias_pontuais] card DepositoSaqueDias ({dia}) não trouxe as colunas "
+                        f"esperadas {faltando} — provável erro do Metabase/ClickHouse na extração "
+                        f"(ver log de [extrai_csv]/[extrai_dados_card] logo acima). "
+                        f"Colunas recebidas: {list(df_dep_saq.columns)[:10]}..."
+                    )
+                df_dep_saq_ajust = df_dep_saq[colunas_esperadas_dep_saq]
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.deleta_dados('inplay.stg_fact_deposits_withdraws_summarized', "", self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_fact_deposits_withdraws_summarized', df_dep_saq_ajust, self.logger)
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.mergeia_dados(
+                    'inplay.stg_fact_deposits_withdraws_summarized', 'inplay.fact_deposits_withdraws_summarized',
+                    df_dep_saq_ajust, ['date', 'hora', 'tipo'], self.logger
+                )
+
+                self.logger.info(f"[reprocessa_dias_pontuais] {cliente} — {dia} concluído")
+
+            self.db_logger.log_operation(
+                operation=f'REPROCESSO_PONTUAL_{cliente}',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro no reprocessamento pontual para {cliente} (dias={dias}): {e}")
+            self.db_logger.log_operation(
+                operation=f'REPROCESSO_PONTUAL_{cliente}',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            raise
+
+    def reprocessa_fact_user_daily_dias(self, cliente: str, dias: list, fontes: list = None):
+        """
+        Reprocessa pontualmente inplay.fact_user_daily para uma lista de
+        dias específicos, refazendo os MERGEs de 'Stage' (aposta de
+        cassino) e/ou 'Saque' a partir dos cards do Metabase.
+
+        Criada pro mesmo incidente da parada de 8+ dias (ver conversa):
+        05/09 e 06/09 ficaram com bet_amount/bet_qty e withdraw_amount/
+        withdraw_quantity inflados em fact_user_daily especificamente —
+        confirmado que NÃO é duplicata de CDC ainda presente na origem
+        (checado direto na Bet/PaymentRequest, a diferença é irrisória
+        perto do excesso observado) — é defasagem: o dado foi carregado
+        durante o catch-up caótico de 14/09 e nunca mais atualizado, e o
+        valor de origem hoje já está correto. Por isso NÃO precisa de
+        dedup nenhum aqui — só re-extrair e re-mergear com o card normal.
+
+        dias: lista de strings 'YYYY-MM-DD'.
+        fontes: subconjunto de ['stage', 'saque'] — default as duas.
+                Ex.: fontes=['stage'] reprocessa só a aposta.
+
+        Diferente de reprocessa_dias_pontuais (que filtra por
+        'reference'/'date', campos de grão fino), aqui o campo de
+        filtro é 'data_referencia' — já é DATE nativo nos dois cards
+        (::DATE no ClickHouse), então usa tipo_campo="type/Date" sem
+        os cuidados de formato string que tivemos com 'reference' em
+        ApostasJogosHora.
+        """
+        if fontes is None:
+            fontes = ['stage', 'saque']
+
+        start_time = datetime.now()
+        try:
+            database = MetabaseDatabase.ClickhousePartnerZeroum.value if cliente == 'ZEROUM' else MetabaseDatabase.ClickhousePartnerEnergiabet.value
+            card_stage = MetabaseCard.ZeroUm_Stage.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Stage.value
+            card_saque = MetabaseCard.ZeroUm_Saque.value if cliente == 'ZEROUM' else MetabaseCard.EnergiaBet_Saque.value
+            auth_id = self.conection(cliente)
+
+            for dia in dias:
+                self.logger.info(f"[reprocessa_fact_user_daily_dias] {cliente} — reprocessando {dia} ({fontes})")
+
+                if 'stage' in fontes:
+                    df_stg = self.extrai_dados_card(
+                        auth_id, database, card_stage, dia, dia,
+                        campo_filtro="data_referencia", tipo_campo="type/Date"
+                    )
+                    faltando = [c for c in ('usuario', 'data_referencia') if c not in df_stg.columns]
+                    if faltando:
+                        raise Exception(
+                            f"[reprocessa_fact_user_daily_dias] card Stage ({dia}) não trouxe as colunas "
+                            f"mínimas {faltando} — provável erro do Metabase/ClickHouse na extração. "
+                            f"Colunas recebidas: {list(df_stg.columns)[:10]}..."
+                        )
+                    df_stg = df_stg.replace({np.nan: None})
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_stg, self.logger)
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.mergeia_dados(
+                        'inplay.stg_fact_user_daily', 'inplay.fact_user_daily',
+                        df_stg, ['usuario', 'data_referencia'], self.logger
+                    )
+
+                if 'saque' in fontes:
+                    df_saque = self.extrai_dados_card(
+                        auth_id, database, card_saque, dia, dia,
+                        campo_filtro="data_referencia", tipo_campo="type/Date"
+                    )
+                    colunas_esperadas_saque = ['usuario', 'data_referencia', 'withdraw_amount', 'withdraw_quantity',
+                                                'withdraw_pending_amount', 'withdraw_pending_quantity',
+                                                'withdraw_denied_amount', 'withdraw_denied_quantity']
+                    faltando = [c for c in colunas_esperadas_saque if c not in df_saque.columns]
+                    if faltando:
+                        raise Exception(
+                            f"[reprocessa_fact_user_daily_dias] card Saque ({dia}) não trouxe as colunas "
+                            f"esperadas {faltando} — provável erro do Metabase/ClickHouse na extração. "
+                            f"Colunas recebidas: {list(df_saque.columns)[:10]}..."
+                        )
+                    df_saque = df_saque[colunas_esperadas_saque].replace({np.nan: None})
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.deleta_dados('inplay.stg_fact_user_daily', "", self.logger)
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.insere_dados_bulk('inplay.stg_fact_user_daily', df_saque, self.logger)
+                    ConnectionDB.conecta(DB, cliente)
+                    ConnectionDB.mergeia_dados(
+                        'inplay.stg_fact_user_daily', 'inplay.fact_user_daily',
+                        df_saque, ['usuario', 'data_referencia'], self.logger
+                    )
+
+                self.logger.info(f"[reprocessa_fact_user_daily_dias] {cliente} — {dia} concluído")
+
+            self.db_logger.log_operation(
+                operation=f'REPROCESSO_FACT_USER_DAILY_{cliente}',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro no reprocessamento de fact_user_daily para {cliente} (dias={dias}): {e}")
+            self.db_logger.log_operation(
+                operation=f'REPROCESSO_FACT_USER_DAILY_{cliente}',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
             raise
 
     def valida_aposta(self, cliente: str, partner_id: int):
@@ -2264,20 +2985,21 @@ ORDER BY toTimeZone(b.LastUpdateTime, 'America/Sao_Paulo')::DATE DESC
 
                 if not divergentes.empty:
                     nome = f"divergencias_{tipo}_aposta_{cliente}_{timestamp}.csv"
-                    divergentes.to_csv(nome, index=False, encoding="utf-8")
+                    salva_csv_conferencia(divergentes, nome)
                     self.logger.warning(
                         f"{tipo} aposta: {len(divergentes)} divergentes "
                         f"({divergentes_timing_skew} explicáveis por timing skew, "
-                        f"{divergentes_suspeitos} suspeitos) -> {nome}"
+                        f"{divergentes_suspeitos} suspeitos)"
+                        + (f" -> {nome}" if EXPORTA_CSV_CONFERENCIA else "")
                     )
 
                 if not so_card.empty:
                     nome = f"so_no_card_{tipo}_aposta_{cliente}_{timestamp}.csv"
-                    so_card.to_csv(nome, index=False, encoding="utf-8")
+                    salva_csv_conferencia(so_card, nome)
 
                 if not so_nativo.empty:
                     nome = f"so_no_nativo_{tipo}_aposta_{cliente}_{timestamp}.csv"
-                    so_nativo.to_csv(nome, index=False, encoding="utf-8")
+                    salva_csv_conferencia(so_nativo, nome)
 
                 linha_resumo = {
                     "tipo": tipo,
@@ -3693,7 +4415,14 @@ GROUP BY ClientId, PixKey, PixType
         for tentativa in range(1, max_tentativas + 1):
             try:
                 response = requests.post(API_ROTA_CSV, headers=header, json=body, timeout=timeout)
-                response.raise_for_status()
+                if not response.ok:
+                    print("\n" + "=" * 100)
+                    print("ERRO RETORNADO PELO METABASE")
+                    print("=" * 100)
+                    print(f"HTTP: {response.status_code}")
+                    print(response.text)
+                    print("=" * 100)
+                    response.raise_for_status()
                 return response.content
             except requests.exceptions.RequestException as e:
                 ultimo_erro = e
@@ -4170,6 +4899,18 @@ GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
             #    afetou as demais queries de Bônus (achado de 19/ago/2026).
             # ================================================================
             executar_agregacao_bonus_concessoes(df_fact_bonus, cliente, DB, self.logger)
+
+            try:
+                executar_agregacao_fraude_bonus(cliente, DB, self.logger)
+                executar_disparo_alertas_bonus(df_fact_bonus, cliente, DB, partner_id, self.logger)
+            #except Exception as e:
+                #self.logger.error(f"[FRAUDE_BONUS] Falha no monitoramento antifraude (não derruba a carga de bônus): {e}")
+
+            except Exception as e:
+                import traceback
+                print(f"[FRAUDE_BONUS] ERRO: {e}")
+                traceback.print_exc()
+                self.logger.error(f"[FRAUDE_BONUS] Falha no monitoramento antifraude (não derruba a carga de bônus): {e}")
 
             self.logger.info(f"Carga de Bônus concluída com sucesso - {cliente}")
             self.db_logger.log_operation(

@@ -10,20 +10,34 @@ class Principal:
                                   "para backfill. Usado por ZEROUM_BONUS/ENERGIABET_BONUS, "
                                   "ZEROUM_SALDO/ENERGIABET_SALDO e ZRO_1_BET")
         parser.add_argument("--data-inicial-backfill", dest="data_inicial_backfill", default=None,
-                             help="Data inicial (YYYY-MM-DDTHH:MM:SS) para o backfill único de dim_usuario")
+                             help="Data inicial (YYYY-MM-DDTHH:MM:SS) para o backfill único de dim_usuario. "
+                                  "Usado também por ZEROUM_VALIDACAO_PERIODO/ENERGIABET_VALIDACAO_PERIODO "
+                                  "(formato YYYY-MM-DD, sem hora, como início do período a validar)")
         parser.add_argument("--data-final", dest="data_final", default=None,
                              help="Data final (YYYY-MM-DDTHH:MM:SS). Usado por ZEROUM_SALDO/ENERGIABET_SALDO "
                                   "(modo backfill de Saldo Diário), ZEROUM_BONUS/ENERGIABET_BONUS "
-                                  "(modo backfill), e por "
+                                  "(modo backfill), por "
                                   "ZEROUM_BACKFILL_HISTORICO_PROTECAO/ENERGIABET_BACKFILL_HISTORICO_PROTECAO "
-                                  "(fecha o intervalo do backfill histórico junto com --data-inicial-backfill)")
+                                  "(fecha o intervalo do backfill histórico junto com --data-inicial-backfill), "
+                                  "e por ZEROUM_VALIDACAO_PERIODO/ENERGIABET_VALIDACAO_PERIODO (formato "
+                                  "YYYY-MM-DD, sem hora, como fim do período a validar)")
         parser.add_argument("--ids-backfill", dest="ids_backfill", default=None,
                              help="Lista de ids separados por vírgula para regularização pontual de dim_usuario (ex.: 123,456,789)")
+        parser.add_argument("--dias-backfill", dest="dias_backfill", default=None,
+                             help="Lista de dias (YYYY-MM-DD) separados por vírgula para "
+                                  "ZEROUM_REPROCESSA_DIAS_PONTUAIS/ENERGIABET_REPROCESSA_DIAS_PONTUAIS "
+                                  "(ex.: 2026-09-05,2026-09-06,2026-09-14). Argumento separado de "
+                                  "--ids-backfill de propósito: este mantém os valores como string "
+                                  "(datas), aquele converte para int (ids)")
         args = parser.parse_args()
 
         ids_backfill = None
         if args.ids_backfill:
             ids_backfill = [int(i.strip()) for i in args.ids_backfill.split(",") if i.strip()]
+
+        dias_backfill = None
+        if args.dias_backfill:
+            dias_backfill = [d.strip() for d in args.dias_backfill.split(",") if d.strip()]
 
         self.consume_api = ConsumeAPI(
             cliente=args.cliente,
@@ -31,6 +45,7 @@ class Principal:
             data_final=args.data_final,
             data_inicial_backfill=args.data_inicial_backfill,
             ids_backfill=ids_backfill,
+            dias_backfill=dias_backfill,
         )
 
 if __name__ == "__main__":
