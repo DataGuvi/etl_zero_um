@@ -779,7 +779,7 @@ def prepara_variaveis_reuso(
             "variavel6": "",
             "variavel7": "",
             "variavel8": "",
-            "variavel9": "",
+            "variavel9": "0",
             "variavel10": "últimas 24h",
         }
 
@@ -883,7 +883,11 @@ def prepara_variaveis_reuso(
             f"{int(row['total_reusos'])}x total"
         )
 
-    bonus_texto = " | ".join(lista_bonus)
+    # variavel9 nunca pode ir vazia (a plataforma de disparo/template exige
+    # valor). Quando nenhum bônus é compartilhado por 2+ clientes -- caso
+    # comum, ex.: reuso isolado de 1 cliente -- a lista fica vazia e o
+    # join devolvia "". Na ausência, retorna "0".
+    bonus_texto = " | ".join(lista_bonus) if lista_bonus else "0"
 
     return {
         "variavel2": str(total_clientes),
@@ -1247,7 +1251,10 @@ def compila_reuso_unico(
     """
 
     if fila_reuso.empty:
-        return _linha_sem_dados("02_reuso", "🟡 Alerta de Reuso de Bônus")
+        linha_sem_dados = _linha_sem_dados("02_reuso", "🟡 Alerta de Reuso de Bônus")
+        # variavel9 do reuso nunca vai vazia/None: na ausência, "0".
+        linha_sem_dados["variavel9"] = "0"
+        return linha_sem_dados
 
     horario_geracao = variaveis.get(
         "variavel1",
@@ -1270,7 +1277,8 @@ def compila_reuso_unico(
         "variavel6": variaveis.get("variavel6", ""),
         "variavel7": variaveis.get("variavel7", ""),
         "variavel8": variaveis.get("variavel8", ""),
-        "variavel9": variaveis.get("variavel9", ""),
+        # "or" cobre ausente, None e string vazia -> sempre "0" na ausência
+        "variavel9": variaveis.get("variavel9") or "0",
         "variavel10": variaveis.get("variavel10", "últimas 24h"),
     }])
 

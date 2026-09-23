@@ -249,6 +249,15 @@ class ConsumeAPI:
             # Chamar via python -c, não via CLI:
             #   ConsumeAPI(cliente='ENERGIABET_PIX', modo='full', partner_id=<valor confirmado>)
             self.processa_agregacao_pix('ENERGIABET', modo=modo, data_final=data_final, partner_id=partner_id)
+        elif cliente == 'ZEROUM_PIX_RELATORIO':
+            # Relatório DIÁRIO de chaves PIX compartilhadas (snapshot + comparação
+            # com a execução anterior). Cron próprio, 1x/dia, SEPARADO da carga
+            # horária ZEROUM_PIX — agendar depois dela. Uso:
+            #     python main.py --cliente ZEROUM_PIX_RELATORIO
+            self.gera_relatorio_pix_multiplas_contas('ZEROUM')
+        elif cliente == 'ENERGIABET_PIX_RELATORIO':
+            self.gera_relatorio_pix_multiplas_contas('ENERGIABET')
+
         else:
             self.logger.error("Cliente inválido")
 
@@ -3947,6 +3956,11 @@ WHERE _peerdb_is_deleted = 0
         data_final (opcional): fecha a janela do modo incremental. Se
         None, usa datetime.now().
         """
+        
+        
+
+
+
         start_time = datetime.now()
         try:
             if partner_id is None:
@@ -4095,6 +4109,225 @@ WHERE _peerdb_is_deleted = 0
             b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
             send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Agregação Pix", body=b)
             raise
+
+    def gera_relatorio_pix_multiplas_contas(self, cliente):
+        """
+        Relatório de chaves PIX compartilhadas por mais de uma conta
+        (pix_key com COUNT(DISTINCT client_id) > 1 em inplay.agg_pix_cliente).
+
+        Roda 1x/dia, como cliente próprio (ZEROUM_PIX_RELATORIO /
+        ENERGIABET_PIX_RELATORIO), em cron separado da carga horária de
+        processa_agregacao_pix — agendar DEPOIS dela (e da carga de
+        dim_usuario), para o snapshot refletir os dados mais recentes.
+        Em 4 passos:
+          1) registra a execução em inplay.execucao_pix_multiplas_contas;
+          2) descobre o id da execução atual e o da execução anterior
+             (último snapshot já gravado em inplay.historico_pix_multiplas_contas);
+          3) grava o snapshot completo do dia no histórico;
+          4) compara snapshot atual x anterior por (pix_key, client_id) e
+             devolve só o que mudou desde a última execução:
+               - NOVO: vínculo (pix_key, client_id) que não existia antes;
+               - STATUS ALTERADO: mesmo vínculo, status do usuário diferente.
+
+        A execução anterior é buscada no HISTÓRICO (MAX(id_execucao) antes de
+        gravar o snapshot atual), e não por "id atual - 1": colunas IDENTITY
+        do Redshift não garantem valores consecutivos, e uma execução que
+        falhou depois do passo 1 deixaria um id "órfão" sem snapshot.
+
+        Na primeira execução (histórico vazio) só grava o snapshot-base e não
+        gera relatório — comparar com "nada" marcaria tudo como NOVO.
+
+        Retorna o DataFrame do relatório (vazio se nada mudou; None se for a
+        primeira execução). Em caso de erro: loga, envia e-mail e re-levanta
+        (mesmo padrão das demais cargas), para o cron sinalizar a falha.
+
+        Pré-requisito: as tabelas de ddl_pix_multiplas_contas.sql precisam
+        existir no banco de cada cliente (ZEROUM e ENERGIABET).
+        """
+        start_time = datetime.now()
+        operation = f'ETL_{cliente}_PIX_RELATORIO'
+        try:
+            self.logger.info(f"Iniciando relatório de PIX com múltiplas contas - {cliente}")
+
+            # 1) registra a execução
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.executa_dml(
+                "INSERT INTO inplay.execucao_pix_multiplas_contas (data_execucao) VALUES (GETDATE())",
+                self.logger
+            )
+
+            # 2) id da execução atual + id da anterior (ainda sem o snapshot atual gravado)
+            ConnectionDB.conecta(DB, cliente)
+            df_ids = ConnectionDB.executa_script(
+                """
+                SELECT
+                    (SELECT MAX(id_execucao) FROM inplay.execucao_pix_multiplas_contas) AS id_execucao,
+                    (SELECT MAX(id_execucao) FROM inplay.historico_pix_multiplas_contas) AS id_execucao_anterior
+                """,
+                self.logger
+            )
+            id_atual = int(df_ids['id_execucao'].iloc[0])
+            id_anterior_raw = df_ids['id_execucao_anterior'].iloc[0]
+            id_anterior = None if pd.isna(id_anterior_raw) else int(id_anterior_raw)
+
+            # 3) grava o snapshot da execução atual
+            self.logger.info(f"Gravando snapshot do PIX - execução {id_atual} (anterior: {id_anterior})")
+            ConnectionDB.conecta(DB, cliente)
+            linhas_snapshot = ConnectionDB.executa_dml(
+                self._sql_snapshot_pix_multiplas_contas(id_atual), self.logger
+            )
+            self.logger.info(f"Snapshot do PIX gravado: {linhas_snapshot} linhas (execução {id_atual})")
+
+            # 4) compara com a execução anterior
+            if id_anterior is None:
+                self.logger.info(
+                    "Relatório de PIX: primeira execução — snapshot-base gravado, "
+                    "sem execução anterior para comparar."
+                )
+                df_relatorio = None
+            else:
+                ConnectionDB.conecta(DB, cliente)
+                df_relatorio = ConnectionDB.executa_script(
+                    self._sql_comparacao_pix_multiplas_contas(id_atual, id_anterior), self.logger
+                )
+                qtd_novo = int((df_relatorio['tipo_alteracao'] == 'NOVO').sum())
+                qtd_status = int((df_relatorio['tipo_alteracao'] == 'STATUS ALTERADO').sum())
+                self.logger.info(
+                    f"Relatório de PIX (execução {id_atual} x {id_anterior}): "
+                    f"{qtd_novo} novos vínculos, {qtd_status} alterações de status"
+                )
+                # chave PIX é dado sensível: só grava CSV se EXPORTA_CSV_CONFERENCIA=true (uso local)
+                salva_csv_conferencia(
+                    df_relatorio, f"relatorio_pix_multiplas_contas_{cliente}_{id_atual}.csv"
+                )
+
+            self.db_logger.log_operation(
+                operation=operation,
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+            return df_relatorio
+
+        except Exception as e:
+            self.logger.error(f"Erro no relatório de PIX com múltiplas contas {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation=operation,
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(
+                subject=f"[FALHA ENGENHARIA] {cliente} - Erro no relatório de PIX com múltiplas contas",
+                body=b
+            )
+            raise
+
+    @staticmethod
+    def _sql_snapshot_pix_multiplas_contas(id_execucao: int):
+        """
+        INSERT ... SELECT do snapshot: uma linha por (pix_key, client_id, pix_type)
+        das chaves PIX ativas usadas por mais de um client_id. data_execucao vem
+        da tabela de controle, para os dois registros terem exatamente o mesmo horário.
+        """
+        return f"""
+        INSERT INTO inplay.historico_pix_multiplas_contas (
+            id_execucao, data_execucao, pix_key, client_id, qtd_contas,
+            pix_type, qtd_transacoes, registration_date, status_usuario, status_nome
+        )
+        WITH qtd_contas_pix AS (
+            SELECT
+                pix_key,
+                COUNT(DISTINCT client_id) AS qtd_contas
+            FROM inplay.agg_pix_cliente
+            WHERE is_active = true
+              AND pix_key IS NOT NULL
+              AND TRIM(pix_key) <> ''
+            GROUP BY pix_key
+            HAVING COUNT(DISTINCT client_id) > 1
+        )
+        SELECT
+            {int(id_execucao)} AS id_execucao,
+            (SELECT data_execucao
+               FROM inplay.execucao_pix_multiplas_contas
+              WHERE id_execucao = {int(id_execucao)}) AS data_execucao,
+            a.pix_key,
+            a.client_id,
+            q.qtd_contas,
+            a.pix_type,
+            a.qtd_transacoes,
+            u.registration_date,
+            u.status_usuario,
+            CASE u.status_usuario
+                WHEN 1  THEN 'Active'
+                WHEN 5  THEN 'Locked'
+                WHEN 7  THEN 'Suspended'
+                WHEN 8  THEN 'Disabled'
+                WHEN 9  THEN 'SelfExcluded'
+                WHEN 10 THEN 'RegulationRestricted'
+                WHEN 11 THEN 'SystemExcluded'
+                WHEN 12 THEN 'CentralizedExcluded'
+                WHEN 13 THEN 'BrazilProgram'
+                WHEN 14 THEN 'BeneficioContinuado'
+                WHEN 15 THEN 'RenegociacaoFies'
+                WHEN 16 THEN 'FiesEmpreendedor'
+                ELSE 'Desconhecido'
+            END AS status_nome
+        FROM inplay.agg_pix_cliente a
+        INNER JOIN qtd_contas_pix q
+            ON q.pix_key = a.pix_key
+        LEFT JOIN inplay.dim_usuario u
+            ON u.id = a.client_id
+        WHERE a.is_active = true
+        """
+
+    @staticmethod
+    def _sql_comparacao_pix_multiplas_contas(id_atual: int, id_anterior: int):
+        """
+        Compara dois snapshots por (pix_key, client_id) e devolve só NOVO e
+        STATUS ALTERADO. O GROUP BY nos dois lados evita linhas duplicadas caso
+        o mesmo (pix_key, client_id) apareça com mais de um pix_type.
+        """
+        return f"""
+        WITH atual AS (
+            SELECT pix_key, client_id,
+                   MAX(qtd_contas) AS qtd_contas,
+                   MAX(status_nome) AS status_nome
+            FROM inplay.historico_pix_multiplas_contas
+            WHERE id_execucao = {int(id_atual)}
+            GROUP BY pix_key, client_id
+        ),
+        anterior AS (
+            SELECT pix_key, client_id,
+                   MAX(status_nome) AS status_nome
+            FROM inplay.historico_pix_multiplas_contas
+            WHERE id_execucao = {int(id_anterior)}
+            GROUP BY pix_key, client_id
+        )
+        SELECT
+            a.pix_key,
+            a.client_id,
+            a.qtd_contas AS qtd_contas_atual,
+            p.status_nome AS status_anterior,
+            a.status_nome AS status_atual,
+            CASE
+                WHEN p.client_id IS NULL THEN 'NOVO'
+                ELSE 'STATUS ALTERADO'
+            END AS tipo_alteracao
+        FROM atual a
+        LEFT JOIN anterior p
+            ON p.pix_key = a.pix_key
+           AND p.client_id = a.client_id
+        WHERE p.client_id IS NULL
+           OR p.status_nome <> a.status_nome
+        ORDER BY a.qtd_contas DESC, a.pix_key, a.client_id
+        """        
+
+
 
     @staticmethod
     def _sql_agregacao_pix(partner_id: int, modo: str, data_inicial: str = None, data_final: str = None):
