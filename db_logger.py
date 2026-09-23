@@ -45,7 +45,7 @@ CLIENTES_ZEROUM = {
     'ZEROUM_PIX',
     # Adicionados nesta conversa (conferência da carga pós-parada de 8+ dias):
     'ZEROUM_VALIDACAO_PERIODO', 'ZEROUM_REPROCESSA_DIAS_PONTUAIS',
-    'ZEROUM_REPROCESSA_FACT_USER_DAILY',
+    'ZEROUM_REPROCESSA_FACT_USER_DAILY', 'ZEROUM_PIX_RELATORIO'
 }
 
 DDL_CREATE_TABLE = f"""
