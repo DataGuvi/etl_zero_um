@@ -12,6 +12,7 @@ __pycache__/
 *.csv
 
 *.log
+.claude
 
 .vscode/
 
