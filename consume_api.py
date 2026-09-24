@@ -257,7 +257,21 @@ class ConsumeAPI:
             self.gera_relatorio_pix_multiplas_contas('ZEROUM')
         elif cliente == 'ENERGIABET_PIX_RELATORIO':
             self.gera_relatorio_pix_multiplas_contas('ENERGIABET')
-
+        elif cliente == 'ZEROUM_BET':
+            # Carga recorrente (cron diário) de Bet (fact_bet), ISOLADA dos
+            # demais crons (Bônus/Saldo/PIX). Uso:
+            #   incremental (padrão, agendar diariamente):
+            #     python main.py --cliente ZEROUM_BET
+            #   backfill/janela específica (data de corte explícita):
+            #     python main.py --cliente ZEROUM_BET --modo 2025-08-29T03:11:00 --data-final 2025-09-01T00:00:00
+            self.processa_bet('ZEROUM', modo=modo, data_final=data_final, partner_id=partner_id)
+        elif cliente == 'ENERGIABET_BET':
+            # partner_id default 181 (confirmado) -- ver processa_bet(). Uso:
+            #   incremental (padrão, agendar diariamente):
+            #     python main.py --cliente ENERGIABET_BET
+            #   backfill/janela específica:
+            #     python main.py --cliente ENERGIABET_BET --modo <ISO> --data-final <ISO>
+            self.processa_bet('ENERGIABET', modo=modo, data_final=data_final, partner_id=partner_id)
         else:
             self.logger.error("Cliente inválido")
 
@@ -5942,4 +5956,629 @@ GROUP BY ClientId, toDate(CreateDate - INTERVAL 3 HOUR)
         self.logger.info(
             f"[BACKFILL BÔNUS - AwardingTime NULO] Bloco {data_ini_str}-{data_fim_str} validado OK "
             f"({total_origem} linhas)"
+        )
+
+    # ================================================================
+    # FACT_BET — pipeline isolado de Bet (ClickHouse `Bet` -> Redshift
+    # inplay.fact_bet), espelhando o pipeline de Bônus (processa_bonus e
+    # vizinhos, acima). 100% ADITIVO: nenhum método/branch/arquivo
+    # existente foi alterado para suportar isto.
+    #
+    # Diferenças estruturais em relação a Bônus:
+    #   - SEM tabelas de dimensão (fact_bet não tem dim_bet/bridge_* —
+    #     não há equivalente a carregar_dimensoes)
+    #   - Filtro de escopo: _peerdb_is_deleted=0 AND ProductId!=6 AND
+    #     PartnerId={partner_id} — SEM fallback para PartnerId IS NULL
+    #     (decisão confirmada com o usuário: nulos não devem ser puxados)
+    #   - Campo de negócio: BetTime (não AwardingTime)
+    #   - Bisseção mínima: 1 HORA (não 1 segundo) — volume de Bet é muito
+    #     maior que Bônus (10-45M linhas/dia)
+    #   - limite_linhas_por_janela default: 950.000 (~9,4% de margem sob o
+    #     teto real do Metabase de 1.048.575) — reduz nº de blocos/chamadas
+    #   - Backfill processa do bloco MAIS RECENTE para o MAIS ANTIGO
+    #     (inverso de processa_bonus_backfill) — ver processa_bet_backfill
+    #   - SEM passo de agregação pós-carga (não há consumidor downstream
+    #     de fact_bet ainda)
+    #   - partner_id: 180 ZEROUM / 181 ENERGIABET (confirmado)
+    # ================================================================
+
+    @staticmethod
+    def _sql_fact_bet(data_inicial, data_final, campo_filtro="BetTime",
+                       filtro_extra="", partner_id=180):
+        """Monta o SQL nativo de fact_bet: CTE de dedup + SELECT final com
+        aliases snake_case idênticos às 36 colunas de inplay.fact_bet."""
+        return f"""
+        WITH bet_dedup AS
+        (
+            SELECT
+                Id, BetId, BetDocumentId, WinDocumentId, PayDocumentId, ClientId,
+                UserId, PartnerId, ProductId, CurrencyId, BetAmount, WinAmount,
+                BonusId, ClientBonusId, BetBonusAmount, WinBonusAmount, Ggr, Ngr,
+                TaxAmount, Coefficient, State, TypeId, DeviceTypeId, MatchType,
+                SelectionsCount, SystemOutCount, SessionId, JackpotDocumentId,
+                BonusDocumentId, HasNote, NgrGgrUpdatedWithoutBonus, BetTime,
+                CalculationTime, PayTime, LastUpdateTime, _peerdb_synced_at
+            FROM Bet
+            WHERE _peerdb_is_deleted = 0
+            AND ProductId != 6
+            AND PartnerId = {partner_id}
+            AND {campo_filtro} >= '{data_inicial.replace("T", " ")}' AND {campo_filtro} < '{data_final.replace("T", " ")}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        SELECT
+            Id                         AS id,
+            BetId                      AS bet_id,
+            BetDocumentId              AS bet_document_id,
+            WinDocumentId              AS win_document_id,
+            PayDocumentId              AS pay_document_id,
+            ClientId                   AS client_id,
+            UserId                     AS user_id,
+            PartnerId                  AS partner_id,
+            ProductId                  AS product_id,
+            CurrencyId                 AS currency_id,
+            BetAmount                  AS bet_amount,
+            WinAmount                  AS win_amount,
+            BonusId                    AS bonus_id,
+            ClientBonusId              AS client_bonus_id,
+            BetBonusAmount             AS bet_bonus_amount,
+            WinBonusAmount             AS win_bonus_amount,
+            Ggr                        AS ggr,
+            Ngr                        AS ngr,
+            TaxAmount                  AS tax_amount,
+            Coefficient                AS coefficient,
+            State                      AS state_id,
+            TypeId                     AS type_id,
+            DeviceTypeId               AS device_type_id,
+            MatchType                  AS match_type,
+            SelectionsCount            AS selections_count,
+            SystemOutCount             AS system_out_count,
+            SessionId                  AS session_id,
+            JackpotDocumentId          AS jackpot_document_id,
+            BonusDocumentId            AS bonus_document_id,
+            HasNote                    AS has_note,
+            NgrGgrUpdatedWithoutBonus  AS ngr_ggr_updated_without_bonus,
+            BetTime                    AS bet_time,
+            CalculationTime            AS calculation_time,
+            PayTime                    AS pay_time,
+            LastUpdateTime             AS last_update_time,
+            _peerdb_synced_at          AS source_updated_at,
+            now()                      AS import_date
+        FROM bet_dedup
+        WHERE 1=1
+        {filtro_extra};
+        """
+
+    def extrai_fact_bet_por_periodo(self, auth_id, id_database,
+                                     data_inicial_dt, data_final_dt,
+                                     campo_filtro="BetTime", filtro_extra="", partner_id=180):
+        """Extrator recursivo por bisseção -- estrutura idêntica a
+        extrai_fact_user_bonus_por_periodo, com caso-base de
+        `duracao <= timedelta(hours=1)` em vez de `seconds=1)` -- volume de
+        Bet (10-45M linhas/dia) torna bisseção por segundo inútil/cara."""
+        LIMITE_MINIMO_DIVISAO = timedelta(hours=1)
+        data_inicial_str = data_inicial_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        data_final_str = data_final_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        duracao = data_final_dt - data_inicial_dt
+
+        self.logger.info(f"Extraindo fact_bet [SQL nativo, {campo_filtro}] de {data_inicial_str} a {data_final_str}")
+        sql = self._sql_fact_bet(data_inicial_str, data_final_str, campo_filtro, filtro_extra, partner_id)
+
+        try:
+            csv = self.extrai_csv_nativo(auth_id, id_database, sql, timeout=240)
+            df = pd.read_csv(io.BytesIO(csv))
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if duracao <= LIMITE_MINIMO_DIVISAO:
+                self.logger.error(
+                    f"fact_bet: falha de conexão ({type(e).__name__}) na janela mínima "
+                    f"({data_inicial_str}-{data_final_str}) — não é possível dividir mais. Erro: {e}"
+                )
+                raise
+            self.logger.warning(
+                f"fact_bet: falha de conexão ({type(e).__name__}) na janela "
+                f"{data_inicial_str}-{data_final_str}. Dividindo ao meio e tentando de novo."
+            )
+            meio = data_inicial_dt + duracao / 2
+            df_primeira_metade = self.extrai_fact_bet_por_periodo(
+                auth_id, id_database, data_inicial_dt, meio, campo_filtro, filtro_extra, partner_id
+            )
+            df_segunda_metade = self.extrai_fact_bet_por_periodo(
+                auth_id, id_database, meio, data_final_dt, campo_filtro, filtro_extra, partner_id
+            )
+            return pd.concat([df_primeira_metade, df_segunda_metade], ignore_index=True)
+
+        if len(df) < self.LIMITE_LINHAS_METABASE:
+            return df
+
+        if duracao <= LIMITE_MINIMO_DIVISAO:
+            self.logger.warning(
+                f"fact_bet: janela mínima (1h) atingida ({data_inicial_str}-"
+                f"{data_final_str}) e ainda assim retornou {len(df)} linhas — "
+                f"possível truncamento residual. Revisar manualmente."
+            )
+            return df
+
+        self.logger.warning(
+            f"fact_bet: {len(df)} linhas (teto do Metabase) para "
+            f"{data_inicial_str}–{data_final_str}. Dividindo a janela ao meio."
+        )
+        meio = data_inicial_dt + duracao / 2
+        df_primeira_metade = self.extrai_fact_bet_por_periodo(
+            auth_id, id_database, data_inicial_dt, meio, campo_filtro, filtro_extra, partner_id
+        )
+        df_segunda_metade = self.extrai_fact_bet_por_periodo(
+            auth_id, id_database, meio, data_final_dt, campo_filtro, filtro_extra, partner_id
+        )
+        return pd.concat([df_primeira_metade, df_segunda_metade], ignore_index=True)
+
+    def _perfil_diario_bet(self, cliente, data_inicial_dt, data_final_dt, partner_id=180):
+        """Mesma otimização de _perfil_diario_bonus: 1 query leve
+        (GROUP BY toDate(BetTime), COUNT(*)) cobrindo todo o intervalo do
+        backfill, em vez de descobrir o volume "na marra".
+
+        Retorna uma lista de tuplas (data: date, contagem: int), ordenada.
+
+        ⚠️ ACHADO REAL (24/set/2026): `data_final_dt.strftime('%Y-%m-%d')`
+        direto no BETWEEN trunca a hora -- se data_final_dt for exatamente
+        meia-noite (ex. data_corte='2026-09-24T00:00:00', usado de propósito
+        para EXCLUIR o dia corrente de um backfill), o BETWEEN incluía o dia
+        inteiro de 24/09 mesmo assim (mesma classe de bug já documentada:
+        comparar timestamp truncado por data gera inclusão/exclusão errada
+        na fronteira). Isso fez o backfill pegar "hoje" de novo -- o mesmo
+        problema de dado incompleto que a correção de data_corte tentava
+        evitar. Corrigido: se data_final_dt é exatamente meia-noite, o
+        último dia do perfil é o dia ANTERIOR (limite exclusivo de verdade).
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = data_inicial_dt.strftime('%Y-%m-%d')
+        if data_final_dt.time() == datetime.min.time():
+            # Meia-noite exata = limite EXCLUSIVO -- o dia de data_final_dt
+            # não deve entrar no perfil, só até o dia anterior.
+            data_fim_str = (data_final_dt - timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            data_fim_str = data_final_dt.strftime('%Y-%m-%d')
+
+        sql_perfil = f"""
+        SELECT
+            toDate(BetTime) AS dia,
+            COUNT(*) AS total
+        FROM Bet
+        WHERE _peerdb_is_deleted = 0
+          AND ProductId != 6
+          AND PartnerId = {partner_id}
+          AND toDate(BetTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+        GROUP BY dia
+        ORDER BY dia
+        """
+        csv_perfil = self.extrai_csv_nativo(auth_id, database, sql_perfil, timeout=300)
+        df_perfil = pd.read_csv(io.BytesIO(csv_perfil))
+        df_perfil['dia'] = pd.to_datetime(df_perfil['dia']).dt.date
+
+        return list(df_perfil.itertuples(index=False, name=None))
+
+    def processa_bet(self, cliente, modo="incremental", data_final=None,
+                      campo_filtro_override=None, filtro_extra="", partner_id=None):
+        """
+        Carga isolada de Bet (fact_bet). Espelha processa_bonus, SEM etapa
+        de dimensões (fact_bet não tem tabela de dimensão própria) e SEM
+        etapa de agregação pós-carga (nenhum consumidor downstream ainda).
+
+        modo="incremental" (padrão): cursor CDC via max(source_updated_at)
+        de inplay.fact_bet, filtra origem por _peerdb_synced_at, overlap de
+        4h (data_base - timedelta(hours=4)) — mesma lógica de processa_bonus.
+        Explicitamente proíbe incremental em tabela vazia.
+
+        modo="<DATA_ISO>": backfill/janela específica, filtra origem por
+        BetTime (campo de negócio).
+
+        partner_id: se None, ZEROUM usa 180, ENERGIABET usa 181 (ambos
+        confirmados) — mesmo padrão de processa_bonus.
+        """
+        try:
+            start_time = datetime.now()
+
+            if partner_id is None:
+                if cliente == 'ZEROUM':
+                    partner_id = 180
+                elif cliente == 'ENERGIABET':
+                    partner_id = 181
+                else:
+                    raise Exception(
+                        "processa_bet('%s', ...): partner_id não informado e não há default "
+                        "conhecido para esse cliente. Confirme o PartnerId correto de Bet e "
+                        "chame novamente com partner_id=<valor confirmado>." % cliente
+                    )
+
+            self.logger.info(
+                f"Iniciando carga de Bet - {cliente} (modo={modo}, data_final={data_final}, partner_id={partner_id})"
+            )
+            self.logger.info("Fazendo a autenticação no Metabase")
+            auth_id = self.conection(cliente)
+
+            database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                        if cliente == 'ZEROUM'
+                        else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+            # ================================================================
+            # FACT_BET — chunking automático por período (sem etapa de
+            # dimensões, fact_bet não tem tabela de dimensão própria)
+            # ================================================================
+            campo_filtro_periodo = campo_filtro_override or (
+                "_peerdb_synced_at" if modo == "incremental" else "BetTime"
+            )
+
+            if modo == "incremental":
+                self.logger.info("Recuperando data base para fact_bet")
+                ConnectionDB.conecta(DB, cliente)
+                data_importacao = ConnectionDB.recupera_dados(
+                    'inplay.fact_bet', 'max(source_updated_at) as source_updated_at', ''
+                )
+                data_base = data_importacao[0][0]
+
+                if data_base is None:
+                    raise Exception(
+                        "inplay.fact_bet está vazia. A primeira carga NÃO pode "
+                        "ser incremental. Chame ConsumeAPI(...).processa_bet('%s', "
+                        "modo='<DATA_CORTE_ISO>'), ex.: modo='2025-08-29T03:11:00', "
+                        "informando uma data de corte explícita antes de rodar em "
+                        "modo incremental." % cliente
+                    )
+                data_inicial_dt = data_base - timedelta(hours=4)
+            else:
+                data_inicial_dt = datetime.fromisoformat(modo)
+
+            data_final_dt = datetime.fromisoformat(data_final) if data_final else datetime.now()
+
+            self.logger.info(
+                f"Extraindo fact_bet [{campo_filtro_periodo}] de "
+                f"{data_inicial_dt} a {data_final_dt}"
+            )
+            df_fact_bet = self.extrai_fact_bet_por_periodo(
+                auth_id, database, data_inicial_dt, data_final_dt,
+                campo_filtro=campo_filtro_periodo, filtro_extra=filtro_extra, partner_id=partner_id
+            )
+            # NÃO fazer df_fact_bet.replace({np.nan: None}) aqui, na tabela
+            # inteira -- ver ACHADO REAL #2 abaixo. O replace() é aplicado
+            # por fatia, dentro do loop de insert.
+
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.deleta_dados('inplay.stg_fact_bet', "", self.logger)
+            ConnectionDB.conecta(DB, cliente)
+            # log_progresso=True NÃO é usado aqui de propósito: essa flag
+            # aciona um trecho de database.py (insere_dados_bulk) que usa
+            # time.monotonic() sem o módulo `time` importado no arquivo --
+            # bug pré-existente, nunca exercitado por processa_bonus (que
+            # nunca passa log_progresso=True). Corrigir database.py está
+            # fora do escopo desta implementação (100% aditiva, sem tocar
+            # em arquivos compartilhados de produção).
+            #
+            # page_size=45000 (não o default de 10000): medido em produção
+            # que o INSERT em lotes de 10K levava ~8-9s cada (~1.100-1.200
+            # linhas/s) — nesse ritmo, o backfill completo (~7,37 bilhões
+            # de linhas antes de dedup) levaria ~75 dias só de INSERT. Lote
+            # maior reduz o número de round-trips de rede.
+            #
+            # ACHADO REAL (23/set/2026): page_size=100000 gerou um statement
+            # de 33.133.717 bytes para 135.342 linhas (~244,85 bytes/linha
+            # nas 36 colunas de fact_bet) -- estourou o limite rígido do
+            # Redshift de 16.777.216 bytes/statement (psycopg2.errors.
+            # SyntaxError: "Statement is too large"). 45000 linhas fica
+            # em ~11M bytes, com margem de segurança sob o teto real.
+            #
+            # ACHADO REAL #2 (23/set/2026): com um bloco de ~12,5M linhas x
+            # 37 colunas, o MemoryError não veio do insert em si -- veio de
+            # `df_fact_bet.replace({np.nan: None})` na tabela INTEIRA, que
+            # força consolidação interna de blocos do pandas (np.vstack),
+            # tentando alocar um array contíguo de 3,46 GiB de uma vez
+            # (traceback: numpy._core._exceptions._ArrayMemoryError:
+            # "Unable to allocate 3.46 GiB for an array with shape
+            # (37, 12537218)"). insere_dados_bulk (database.py) também
+            # converteria o DataFrame inteiro via df.values (mesmo risco).
+            # Blocos de Bet podem ter dezenas de milhões de linhas (bem
+            # maior que qualquer carga de Bônus) -- por isso fatiamos o
+            # DataFrame ANTES do replace() e do insert, sem alterar
+            # database.py, mesmo princípio do page_size acima.
+            TAMANHO_FATIA_INSERT = 500000
+            total_linhas_insert = len(df_fact_bet)
+            for inicio_fatia in range(0, total_linhas_insert, TAMANHO_FATIA_INSERT):
+                fatia = df_fact_bet.iloc[inicio_fatia:inicio_fatia + TAMANHO_FATIA_INSERT].replace({np.nan: None})
+                ConnectionDB.conecta(DB, cliente)
+                ConnectionDB.insere_dados_bulk('inplay.stg_fact_bet', fatia, self.logger, page_size=45000)
+                self.logger.info(
+                    f"fact_bet: fatia de insert {min(inicio_fatia + TAMANHO_FATIA_INSERT, total_linhas_insert)}"
+                    f"/{total_linhas_insert} linhas gravadas em stg_fact_bet"
+                )
+            ConnectionDB.conecta(DB, cliente)
+            ConnectionDB.mergeia_dados(
+                'inplay.stg_fact_bet', 'inplay.fact_bet',
+                df_fact_bet, ['id'], self.logger
+            )
+            self.logger.info(f"fact_bet: {len(df_fact_bet)} linhas carregadas")
+
+            # Sem etapa de agregação pós-carga (equivalente a
+            # executar_agregacao_bonus_concessoes/fraude_bonus) — nenhum
+            # consumidor downstream de fact_bet ainda. Se/quando existir,
+            # adicionar aqui como nova etapa, sem alterar o que já existe acima.
+
+            self.logger.info(f"Carga de Bet concluída com sucesso - {cliente}")
+            self.db_logger.log_operation(
+                operation='ETL_BET',
+                status='SUCCESS',
+                start_time=start_time,
+                end_time=datetime.now(),
+                cliente=cliente
+            )
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Erro de rede na carga de Bet {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation='ETL_BET',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Bet", body=b)
+            raise Exception(f"Erro na carga de Bet {cliente}: {e}")
+        except Exception as e:
+            self.logger.error(f"Erro na carga de Bet {cliente}: {e}")
+            self.db_logger.log_operation(
+                operation='ETL_BET',
+                status='FAILED',
+                start_time=start_time,
+                end_time=datetime.now(),
+                error_reason=str(e),
+                cliente=cliente
+            )
+            b = f"Descrição do erro:\n{e}\n\n=== HISTÓRICO DO LOGGER ===\n{self.get_log_history()}"
+            send_email(subject=f"[FALHA ENGENHARIA] {cliente} - Erro na carga de Bet", body=b)
+            raise
+
+    def processa_bet_backfill(self, cliente, data_inicio_historico, data_corte,
+                               tamanho_bloco_dias=None, validar_blocos=True,
+                               limite_linhas_por_janela=950000, partner_id=None):
+        """
+        Carga histórica (backfill) de Bet, com janelas dimensionadas pelo
+        volume real de cada período (não por um número fixo de dias).
+
+        Diferença deliberada em relação a processa_bonus_backfill: processa
+        os blocos do MAIS RECENTE para o MAIS ANTIGO (não o inverso) --
+        decisão do usuário, permite que o cron incremental comece a rodar
+        sobre dados recentes mais cedo, mesmo com meses antigos ainda em
+        backfill em paralelo/depois.
+
+        Retomada após falha: como a ordem é invertida, um bloco que falha
+        significa que TUDO que é mais recente já foi carregado com sucesso.
+        Para retomar: chamar de novo com o MESMO data_inicio_historico, e
+        data_corte = início (ISO) do bloco que falhou.
+
+        Parâmetros:
+            cliente: 'ZEROUM' ou 'ENERGIABET'
+            data_inicio_historico: string ISO, ex. '2025-08-29T03:11:00'
+            data_corte: string ISO, ex. '2026-09-22T00:00:00'
+            tamanho_bloco_dias: se informado (int), volta ao comportamento
+                de blocos fixos em dias, ignorando o perfil de volume.
+                Default None = usa o modo otimizado (recomendado).
+            validar_blocos: mesma semântica de processa_bonus_backfill.
+            limite_linhas_por_janela: teto de linhas por janela no modo
+                otimizado (default 950.000, ~9,4% de margem sob o teto real
+                do Metabase de 1.048.575 -- ajustado de 500.000 para reduzir
+                o número de blocos/chamadas do backfill, já que threading
+                não é seguro com o ConnectionDB atual, ver conversa).
+        """
+        data_atual = datetime.fromisoformat(data_inicio_historico)
+        data_corte_dt = datetime.fromisoformat(data_corte)
+
+        if data_atual >= data_corte_dt:
+            raise ValueError(
+                f"data_inicio_historico ({data_atual}) precisa ser anterior "
+                f"a data_corte ({data_corte_dt})."
+            )
+
+        if partner_id is None:
+            if cliente == 'ZEROUM':
+                partner_id = 180
+            elif cliente == 'ENERGIABET':
+                partner_id = 181
+            else:
+                raise Exception(
+                    "processa_bet_backfill('%s', ...): partner_id não informado e não há default "
+                    "conhecido para esse cliente. Confirme o PartnerId correto de Bet e chame "
+                    "novamente com partner_id=<valor confirmado>." % cliente
+                )
+
+        if tamanho_bloco_dias is not None:
+            # Modo fallback: blocos fixos em dias (comportamento antigo)
+            bloco = timedelta(days=tamanho_bloco_dias)
+            janelas = []
+            cursor = data_atual
+            while cursor < data_corte_dt:
+                fim = min(cursor + bloco, data_corte_dt)
+                janelas.append((cursor.date(), fim.date()))
+                cursor = fim
+            self.logger.info(
+                f"[BACKFILL BET] Modo fallback (blocos fixos de "
+                f"{tamanho_bloco_dias} dias) — {len(janelas)} blocos"
+            )
+        else:
+            # Modo otimizado: 1 query de perfil, janelas dimensionadas por volume
+            self.logger.info(
+                "[BACKFILL BET] Calculando perfil de volume diário "
+                "(1 query, evita downloads desperdiçados)..."
+            )
+            perfil = self._perfil_diario_bet(cliente, data_atual, data_corte_dt, partner_id=partner_id)
+            janelas_data = self._monta_janelas_por_volume(perfil, limite_linhas_por_janela)
+            janelas = [
+                (datetime.combine(ini, datetime.min.time()),
+                 datetime.combine(fim, datetime.min.time()) + timedelta(days=1))
+                for ini, fim in janelas_data
+            ]
+            total_linhas_perfil = sum(t for _, t in perfil)
+            self.logger.info(
+                f"[BACKFILL BET] Perfil calculado: {len(perfil)} dias, "
+                f"~{total_linhas_perfil} linhas totais (antes de dedup), "
+                f"{len(janelas)} janelas de até {limite_linhas_por_janela} linhas cada"
+            )
+
+        # >>> Inversão deliberada: mais recente -> mais antigo <<<
+        janelas = list(reversed(janelas))
+
+        total_blocos_previsto = len(janelas)
+        self.logger.info(
+            f"[BACKFILL BET] Iniciando (ordem MAIS RECENTE -> MAIS ANTIGO) — {cliente}, "
+            f"cobrindo {data_atual} até {data_corte_dt}, {total_blocos_previsto} janelas previstas"
+        )
+
+        inicio_execucao = time.monotonic()
+        total_blocos = 0
+        for data_ini_bloco, data_fim_bloco in janelas:
+            total_blocos += 1
+            inicio_bloco = time.monotonic()
+
+            self.logger.info(
+                f"[BACKFILL BET] Bloco {total_blocos}/{total_blocos_previsto}: "
+                f"{data_ini_bloco.strftime('%Y-%m-%d')} -> {data_fim_bloco.strftime('%Y-%m-%d')}"
+            )
+
+            MAX_TENTATIVAS_BLOCO = 3
+            ERROS_TRANSITORIOS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+            for tentativa in range(1, MAX_TENTATIVAS_BLOCO + 1):
+                try:
+                    self.processa_bet(
+                        cliente,
+                        modo=data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        data_final=data_fim_bloco.strftime('%Y-%m-%dT%H:%M:%S'),
+                        partner_id=partner_id
+                    )
+                    break  # sucesso, sai do loop de retry
+                except ERROS_TRANSITORIOS as e:
+                    if tentativa >= MAX_TENTATIVAS_BLOCO:
+                        self.logger.error(
+                            f"[BACKFILL BET] Bloco {data_ini_bloco.strftime('%Y-%m-%d')} "
+                            f"-> {data_fim_bloco.strftime('%Y-%m-%d')} falhou {MAX_TENTATIVAS_BLOCO}x "
+                            f"por erro de conexão. Como o backfill roda do mais recente para o "
+                            f"mais antigo, tudo mais recente que este bloco JÁ FOI carregado. "
+                            f"Para retomar, chame processa_bet_backfill(cliente='{cliente}', "
+                            f"data_inicio_historico='{data_inicio_historico}', "
+                            f"data_corte='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}'). Erro: {e}"
+                        )
+                        raise
+                    espera = 30 * tentativa  # 30s, depois 60s
+                    self.logger.warning(
+                        f"[BACKFILL BET] Erro de conexão no bloco "
+                        f"{data_ini_bloco.strftime('%Y-%m-%d')} (tentativa {tentativa}/"
+                        f"{MAX_TENTATIVAS_BLOCO}): {type(e).__name__}: {e}. "
+                        f"Tentando de novo em {espera}s..."
+                    )
+                    time.sleep(espera)
+                except Exception as e:
+                    self.logger.error(
+                        f"[BACKFILL BET] Falhou no bloco {data_ini_bloco.strftime('%Y-%m-%d')} "
+                        f"-> {data_fim_bloco.strftime('%Y-%m-%d')}. Como o backfill roda do mais "
+                        f"recente para o mais antigo, tudo mais recente que este bloco JÁ FOI "
+                        f"carregado. Para retomar, chame processa_bet_backfill(cliente='{cliente}', "
+                        f"data_inicio_historico='{data_inicio_historico}', "
+                        f"data_corte='{data_ini_bloco.strftime('%Y-%m-%dT%H:%M:%S')}'). Erro: {e}"
+                    )
+                    raise
+
+            if validar_blocos:
+                self._valida_bloco_bet(cliente, data_ini_bloco, data_fim_bloco - timedelta(days=1), partner_id=partner_id)
+
+            duracao_bloco = time.monotonic() - inicio_bloco
+            tempo_decorrido = time.monotonic() - inicio_execucao
+            media_por_bloco = tempo_decorrido / total_blocos
+            blocos_restantes = max(total_blocos_previsto - total_blocos, 0)
+            eta_restante = media_por_bloco * blocos_restantes
+            self.logger.info(
+                f"[BACKFILL BET] Bloco {total_blocos}/{total_blocos_previsto} concluído em "
+                f"{self._formata_duracao(duracao_bloco)} | decorrido: {self._formata_duracao(tempo_decorrido)} | "
+                f"média/bloco: {self._formata_duracao(media_por_bloco)} | "
+                f"restante (estimado, blocos mais antigos): {self._formata_duracao(eta_restante)}"
+            )
+
+        tempo_total = time.monotonic() - inicio_execucao
+        self.logger.info(
+            f"[BACKFILL BET] Concluído — {total_blocos} blocos processados, {cliente}, "
+            f"cobrindo {data_atual} até {data_corte_dt.strftime('%Y-%m-%d')}, "
+            f"tempo total: {self._formata_duracao(tempo_total)}"
+        )
+
+    def _valida_bloco_bet(self, cliente, data_inicio_bloco, data_fim_bloco, partner_id=180):
+        """
+        Validação automática de um bloco do backfill: compara a contagem
+        de linhas na origem (Bet, já deduplicado) com a contagem na tabela
+        destino (fact_bet), na mesma janela de BetTime.
+
+        Se não bater, loga ERROR e levanta exceção — o backfill para nesse
+        bloco em vez de seguir acumulando dados possivelmente incorretos.
+
+        ⚠️ Mesma correção crítica de _valida_bloco_bonus (achado real,
+        validado com dados de produção do pipeline de Bônus): a query do
+        destino usa `bet_time >= data_ini AND bet_time < data_fim_exclusivo`
+        (limite superior EXCLUSIVO), não `BETWEEN data_ini AND data_fim` --
+        BETWEEN contra uma string de data pura truncaria a hora e geraria
+        falso positivo de "perda de dados".
+        """
+        auth_id = self.conection(cliente)
+        database = (MetabaseDatabase.ClickhousePartnerZeroum.value
+                    if cliente == 'ZEROUM'
+                    else MetabaseDatabase.ClickhousePartnerEnergiabet.value)
+
+        data_ini_str = data_inicio_bloco.strftime('%Y-%m-%d')
+        data_fim_str = data_fim_bloco.strftime('%Y-%m-%d')
+
+        sql_origem = f"""
+        SELECT COUNT(*) AS total FROM (
+            SELECT Id
+            FROM Bet
+            WHERE _peerdb_is_deleted = 0
+              AND ProductId != 6
+              AND PartnerId = {partner_id}
+              AND toDate(BetTime) BETWEEN '{data_ini_str}' AND '{data_fim_str}'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Id
+                ORDER BY _peerdb_version DESC, _peerdb_synced_at DESC
+            ) = 1
+        )
+        """
+        csv_origem = self.extrai_csv_nativo(auth_id, database, sql_origem, timeout=300)
+        df_origem = pd.read_csv(io.BytesIO(csv_origem))
+        total_origem = int(df_origem['total'].iloc[0])
+
+        # Limite superior EXCLUSIVO e um dia à frente -- ver docstring.
+        data_fim_exclusivo_str = (data_fim_bloco + timedelta(days=1)).strftime('%Y-%m-%d')
+
+        ConnectionDB.conecta(DB, cliente)
+        resultado_destino = ConnectionDB.recupera_dados(
+            'inplay.fact_bet',
+            'COUNT(*)',
+            f"WHERE partner_id = {partner_id} AND bet_time >= '{data_ini_str}' AND bet_time < '{data_fim_exclusivo_str}'"
+        )
+        total_destino = resultado_destino[0][0]
+
+        if total_origem != total_destino:
+            self.logger.error(
+                f"[BACKFILL BET] VALIDAÇÃO FALHOU no bloco {data_ini_str}-{data_fim_str}: "
+                f"origem={total_origem}, destino={total_destino} (diferença={total_origem - total_destino})"
+            )
+            raise Exception(
+                f"Validação de contagem falhou no bloco {data_ini_str}-{data_fim_str}: "
+                f"origem={total_origem} x destino={total_destino}"
+            )
+
+        self.logger.info(
+            f"[BACKFILL BET] Bloco {data_ini_str}-{data_fim_str} validado OK "
+            f"({total_origem} linhas em ambos os lados)"
         )
